@@ -83,6 +83,7 @@ MatrixController::MatrixController(QObject *parent) : QObject(parent)
         d->backupKey = MatrixSecrets::unprotect(settings.value("backupKey").toString());
         d->failoverEnabled = settings.value("failoverEnabled", false).toBool();
         d->videoBitrate = qBound(500, settings.value("videoBitrate", 3500).toInt(), 50000);
+        d->videoEncoderId = settings.value("videoEncoderId", "obs_x264").toString();
         d->audioBitrate = qBound(64, settings.value("audioBitrate", 160).toInt(), 320);
         settings.endGroup();
         destinations.push_back(std::move(d));
@@ -206,6 +207,7 @@ void MatrixController::save() const
         settings.setValue("key", MatrixSecrets::protect(d.key));
         settings.setValue("audioMix", d.audioMix);
         settings.setValue("videoBitrate", d.videoBitrate);
+        settings.setValue("videoEncoderId", d.videoEncoderId);
         settings.setValue("audioBitrate", d.audioBitrate);
         settings.setValue("videoSourceUuid", d.videoSourceUuid);
         settings.setValue("group", d.group);
@@ -240,6 +242,21 @@ void MatrixController::onAudioSamples(void *param, size_t, struct audio_data *da
     }
 }
 
+QJsonArray MatrixController::videoEncoders() const
+{
+    QJsonArray result;
+    const char *id = nullptr;
+    for (size_t idx = 0; obs_enum_encoder_types(idx, &id); ++idx) {
+        if (!id || obs_get_encoder_type(id) != OBS_ENCODER_VIDEO)
+            continue;
+        const char *codec = obs_get_encoder_codec(id);
+        if (!codec || QByteArray(codec).toLower() != "h264")
+            continue;
+        result.append(QJsonObject{{"id", QString::fromUtf8(id)}});
+    }
+    return result;
+}
+
 QJsonArray MatrixController::audioMeters() const
 {
     QJsonArray result;
@@ -268,6 +285,7 @@ QJsonArray MatrixController::outputs() const
         item["keyConfigured"] = !d.key.isEmpty();
         item["audioMix"] = d.audioMix + 1;
         item["videoBitrate"] = d.videoBitrate;
+        item["videoEncoderId"] = d.videoEncoderId;
         item["audioBitrate"] = d.audioBitrate;
         item["videoSourceUuid"] = d.videoSourceUuid;
         item["group"] = d.group;
@@ -310,7 +328,8 @@ QJsonObject MatrixController::status() const
                        {"audioSources", sources()},
                        {"videoScenes", scenes()},
                        {"groups", groups()},
-                       {"audioBusCount", 16}, {"audioMeters", audioMeters()}};
+                       {"audioBusCount", 16}, {"audioMeters", audioMeters()},
+                       {"videoEncoders", videoEncoders()}};
 }
 
 bool MatrixController::configure(const QString &id, const QJsonObject &changes, QString &error)
@@ -332,6 +351,19 @@ bool MatrixController::configure(const QString &id, const QJsonObject &changes, 
     const int mix = changes.contains("audioMix") ? changes.value("audioMix").toInt(-1) : d->audioMix + 1;
     const int videoBitrate =
         changes.contains("videoBitrate") ? changes.value("videoBitrate").toInt(-1) : d->videoBitrate;
+    const QString videoEncoderId = changes.contains("videoEncoderId")
+        ? changes.value("videoEncoderId").toString() : d->videoEncoderId;
+    bool encoderFound = false;
+    for (const auto &value : videoEncoders()) {
+        if (value.toObject().value("id").toString() == videoEncoderId) {
+            encoderFound = true;
+            break;
+        }
+    }
+    if (!encoderFound) {
+        error = "Selected H.264 video encoder is unavailable";
+        return false;
+    }
     const int audioBitrate =
         changes.contains("audioBitrate") ? changes.value("audioBitrate").toInt(-1) : d->audioBitrate;
     const QString scene = changes.contains("videoSourceUuid") ? changes.value("videoSourceUuid").toString() : d->videoSourceUuid;
@@ -368,6 +400,7 @@ bool MatrixController::configure(const QString &id, const QJsonObject &changes, 
     d->name = name;
     d->audioMix = mix - 1;
     d->videoBitrate = videoBitrate;
+    d->videoEncoderId = videoEncoderId;
     d->audioBitrate = audioBitrate;
     d->videoSourceUuid = scene;
     d->group = group;
@@ -420,20 +453,22 @@ bool MatrixController::startAttempt(Destination &d, bool useBackup, QString &err
     obs_data_set_string(videoSettings, "rate_control", "CBR");
     obs_data_set_int(videoSettings, "bitrate", d.videoBitrate);
     obs_data_set_int(videoSettings, "keyint_sec", 2);
-    obs_data_set_string(videoSettings, "preset", "veryfast");
+    if (d.videoEncoderId == "obs_x264")
+        obs_data_set_string(videoSettings, "preset", "veryfast");
 
     // Encoder sharing is safe only when video settings and video context match.
     for (const auto &other : destinations) {
         if (other.get() == &d || !other->video || !obs_encoder_active(other->video))
             continue;
         if (other->videoSourceUuid == d.videoSourceUuid && other->videoBitrate == d.videoBitrate &&
+            other->videoEncoderId == d.videoEncoderId &&
             other->video && other->videoSourceUuid.isEmpty()) {
             d.video = obs_encoder_get_ref(other->video);
             break;
         }
     }
     if (!d.video)
-        d.video = obs_video_encoder_create("obs_x264", (prefix + "_video").toUtf8().constData(),
+        d.video = obs_video_encoder_create(d.videoEncoderId.toUtf8().constData(), (prefix + "_video").toUtf8().constData(),
                                            videoSettings, nullptr);
     obs_data_release(videoSettings);
 
@@ -638,7 +673,8 @@ bool MatrixController::savePreset(const QString &name, QString &error)
     for (const auto &dest : destinations) {
         QJsonObject o{{"id", dest->id}, {"name", dest->name}, {"server", dest->server},
                       {"audioMix", dest->audioMix + 1}, {"videoBitrate", dest->videoBitrate},
-                      {"audioBitrate", dest->audioBitrate}, {"videoSourceUuid", dest->videoSourceUuid},
+                      {"audioBitrate", dest->audioBitrate}, {"videoEncoderId", dest->videoEncoderId},
+                      {"videoSourceUuid", dest->videoSourceUuid},
                       {"group", dest->group}, {"backupServer", dest->backupServer},
                       {"failoverEnabled", dest->failoverEnabled}};
         outputList.append(o);
