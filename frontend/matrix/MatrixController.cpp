@@ -88,6 +88,7 @@ MatrixController::MatrixController(QObject *parent) : QObject(parent)
         settings.endGroup();
         destinations.push_back(std::move(d));
     }
+    cpuInfo = os_cpu_usage_info_start();
     for (size_t i = 0; i < busMeters.size(); ++i) {
         BusMeter &meter = busMeters[i];
         meter.lastSignalMs.store(std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -106,6 +107,10 @@ MatrixController::~MatrixController()
     for (size_t i = 0; i < busMeters.size(); ++i) {
         if (busMeters[i].connected)
             audio_output_disconnect(obs_get_audio(), i, onAudioSamples, &busMeters[i]);
+    }
+    if (cpuInfo) {
+        os_cpu_usage_info_destroy(cpuInfo);
+        cpuInfo = nullptr;
     }
     for (auto &destination : destinations) {
         Destination &d = *destination;
@@ -329,7 +334,9 @@ QJsonObject MatrixController::status() const
                        {"videoScenes", scenes()},
                        {"groups", groups()},
                        {"audioBusCount", 16}, {"audioMeters", audioMeters()},
-                       {"videoEncoders", videoEncoders()}};
+                       {"videoEncoders", videoEncoders()},
+                       {"cpuPercent", lastCpuPercent},
+                       {"processMemoryMb", double(os_get_proc_resident_size()) / (1024.0 * 1024.0)}};
 }
 
 bool MatrixController::configure(const QString &id, const QJsonObject &changes, QString &error)
@@ -781,6 +788,8 @@ bool MatrixController::anyActive() const
 
 void MatrixController::collectTelemetry()
 {
+    if (cpuInfo)
+        lastCpuPercent = os_cpu_usage_info_query(cpuInfo);
     const qint64 now = QDateTime::currentMSecsSinceEpoch();
     if (lastTelemetryMs > 0) {
         const double interval = double(now - lastTelemetryMs) / 1000.0;
