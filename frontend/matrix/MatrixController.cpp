@@ -30,7 +30,9 @@ bool collectAudioSources(void *data, obs_source_t *source)
     QJsonObject item;
     item["uuid"] = QString::fromUtf8(obs_source_get_uuid(source));
     item["name"] = QString::fromUtf8(obs_source_get_name(source));
-    item["mixers"] = int(obs_source_get_audio_mixers(source) & 63u);
+    item["mixers"] = int(obs_source_get_audio_mixers(source) & 65535u);
+    item["muted"] = obs_source_muted(source);
+    item["volume"] = double(obs_source_get_volume(source));
     list->sources.append(item);
     return true;
 }
@@ -326,9 +328,90 @@ QJsonArray MatrixController::sources() const
     return list.sources;
 }
 
+QJsonObject MatrixController::mainStatus() const
+{
+    obs_source_t *scene = obs_frontend_get_current_scene();
+    QJsonObject status{{"streaming", obs_frontend_streaming_active()},
+                       {"recording", obs_frontend_recording_active()},
+                       {"studioMode", obs_frontend_preview_program_mode_active()},
+                       {"programSceneUuid", scene ? QString::fromUtf8(obs_source_get_uuid(scene)) : QString()},
+                       {"programSceneName", scene ? QString::fromUtf8(obs_source_get_name(scene)) : QString()}};
+    if (scene)
+        obs_source_release(scene);
+    return status;
+}
+
+bool MatrixController::controlMain(const QString &action, QString &error)
+{
+    if (action == "stream/start")
+        obs_frontend_streaming_start();
+    else if (action == "stream/stop")
+        obs_frontend_streaming_stop();
+    else if (action == "record/start")
+        obs_frontend_recording_start();
+    else if (action == "record/stop")
+        obs_frontend_recording_stop();
+    else if (action == "studio/enable")
+        obs_frontend_set_preview_program_mode(true);
+    else if (action == "studio/disable")
+        obs_frontend_set_preview_program_mode(false);
+    else {
+        error = "Unknown OBS frontend action";
+        return false;
+    }
+    return true;
+}
+
+bool MatrixController::setProgramScene(const QString &uuid, QString &error)
+{
+    obs_source_t *source = obs_get_source_by_uuid(uuid.toUtf8().constData());
+    if (!source || !obs_scene_from_source(source)) {
+        if (source)
+            obs_source_release(source);
+        error = "Scene not found";
+        return false;
+    }
+    obs_frontend_set_current_scene(source);
+    obs_source_release(source);
+    return true;
+}
+
+bool MatrixController::controlAudioSource(const QString &uuid, const QJsonObject &changes, QString &error)
+{
+    obs_source_t *source = obs_get_source_by_uuid(uuid.toUtf8().constData());
+    if (!source) {
+        error = "Audio source not found";
+        return false;
+    }
+    if (!(obs_source_get_output_flags(source) & OBS_SOURCE_AUDIO)) {
+        obs_source_release(source);
+        error = "Source has no audio";
+        return false;
+    }
+    if (changes.contains("muted") && !changes.value("muted").isBool()) {
+        obs_source_release(source);
+        error = "muted must be a boolean";
+        return false;
+    }
+    if (changes.contains("volume") &&
+        (!changes.value("volume").isDouble() || changes.value("volume").toDouble() < 0.0 ||
+         changes.value("volume").toDouble() > 4.0)) {
+        obs_source_release(source);
+        error = "volume must be 0.0..4.0";
+        return false;
+    }
+    if (changes.contains("muted"))
+        obs_source_set_muted(source, changes.value("muted").toBool());
+    if (changes.contains("volume"))
+        obs_source_set_volume(source, float(changes.value("volume").toDouble()));
+    obs_source_release(source);
+    return true;
+}
+
 QJsonObject MatrixController::status() const
 {
     return QJsonObject{{"mainStreaming", obs_frontend_streaming_active()},
+                       {"program", mainStatus()},
                        {"matrixOutputs", outputs()},
                        {"audioSources", sources()},
                        {"videoScenes", scenes()},
