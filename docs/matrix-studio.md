@@ -1,95 +1,114 @@
-# OBS Matrix Studio — native fork MVP
+# OBS Matrix Studio — Windows x64 experimental fork
 
-This feature is built into the OBS Studio frontend source tree, **not a loadable plugin**.
-It is an early prototype, not a verified production-ready broadcast system.
+Native OBS Studio fork (not a plugin), based on libobs and the Qt frontend.
 
-## Scope
+## What's implemented in this branch
 
-- Eight independently managed RTMP/RTMPS outputs by default, with add/remove support (up to 64 configured destinations). All currently share the OBS program video.
-- Each destination selects one of OBS's existing six audio mixers.
-- Six-track source routing matrix using OBS's native \`obs_source_set_audio_mixers\`.
-- Built-in Qt dock with per-output server, key, track, start/stop, and status.
-- Read-only status and writable control HTTP API on **127.0.0.1:4456**.
-- Per-user settings stored by QSettings (Giantturning / OBSMatrixStudio).
+- 8 RTMP(S) outputs by default; create/delete destinations dynamically (up to 64 configurations).
+- 16 native OBS audio buses instead of the stock 6. The source routing matrix supports 16-bit routing masks (0–65535).
+- Per-output Program video or separate OBS scene via OBS view rendering. Each output may use its own selected H.264 encoder, bitrate, audio bus, RTMP URL/key and backup server.
+- Dynamic video encoder discovery: choose a listed H.264 encoder, including hardware encoders (NVENC, QSV or AMF) if OBS exposes them at runtime. Hardware combinations are not yet tested.
+- Encoder sharing for matching Program-only outputs and matching bitrate/encoder ID (experimental).
+- Backup RTMP URL/key and one automatic backup attempt after a primary failure or when native reconnect has stopped. No seamless switch or automatic failback yet.
+- Named output groups with start/stop.
+- Named presets for destination and source mixer routing. For safety, stream keys are not duplicated into presets.
+- Per-output outgoing bitrate, reconnect status, frame drops, connection time, and live/backup state.
+- 16 native audio peak meters and silence alarms for active outputs (threshold -55 dB, more than 10 seconds).
+- Browser dashboard: http://127.0.0.1:4456/dashboard
+- Local REST API on 127.0.0.1:4456 and read-only WebSocket event stream on 127.0.0.1:4457/events.
+- API audit log for REST modifications, without request bodies or credentials.
+- Windows DPAPI protects stream keys, backup keys, and the API bearer token in user settings. The Qt Matrix Control dock has Copy token / Show token buttons.
 
-The RTMP output encoder currently uses **x264 software encoding** for each destination.
-Eight or more concurrent encoders can require substantial CPU; the limit of 64 is a configuration ceiling, not a performance guarantee. Hardware encoders, encoder sharing,
-per-output scene/video routing, resilient state management, and enhanced credential
-storage are planned improvements, not implemented features.
+IMPORTANT: This is a development branch. All changes require a successful Windows x64 GitHub Actions build plus end-to-end live RTMP and audio/video routing tests. A successful build alone is not proof of production stability.
 
-## Configuration and secrets
+## REST API
 
-The API binds only to loopback. At first launch it generates a long random bearer token.
-The token is found in the \`apiToken\` field of the per-user OBSMatrixStudio.ini
-configuration file. Do not commit or share the INI file: **stream keys and the API token
-are stored there in plaintext**. Use a protected OS user account and appropriate file
-permissions. API output responses redact stream keys.
+All requests except GET /dashboard need the bearer Authorization header.
+For POST/PATCH/PUT sends use JSON.
 
-For remote network access, use an authenticated local tunnel. **Do not expose port 4456
-directly to the internet.** The HTTP parser is intentionally small and should be replaced
-with a more hardened implementation before production or untrusted-network use.
-
-## API
-
-All requests require \`Authorization: Bearer <apiToken>\` and JSON request bodies for writes.
-
-| Method | Path | Behavior |
+| Method | Endpoint | Function |
 | --- | --- | --- |
-| GET | /api/v1/status | Main stream status, outputs, audio sources |
-| GET | /api/v1/outputs | RTMP states and destinations (no keys) |
-| POST | /api/v1/outputs | Create a new output (returns its id) |
-| DELETE | /api/v1/outputs/{id} | Remove a stopped output |
-| GET | /api/v1/matrix | Audio source UUIDs and 6-bit routing masks |
-| PATCH | /api/v1/outputs/rtmp-01/config | Set name, server, key, audioMix (1–6), videoBitrate, audioBitrate |
-| POST | /api/v1/outputs/rtmp-01/start | Start one output |
-| POST | /api/v1/outputs/rtmp-01/stop | Stop one output |
-| PUT | /api/v1/matrix/{source-uuid} | Set \`{"mixers": 5}\` to route one source to tracks 1 and 3 |
+| GET | /api/v1/status | All outputs, audio routing, meter levels, scenes, encoder choices |
+| GET | /api/v1/health | Counts of streaming, backup, reconnecting, silent outputs |
+| GET | /api/v1/outputs | Current destinations; secret keys omitted |
+| POST | /api/v1/outputs | Create an RTMP destination |
+| DELETE | /api/v1/outputs/{id} | Remove a stopped destination |
+| PATCH | /api/v1/outputs/{id}/config | Configure a stopped output |
+| POST | /api/v1/outputs/{id}/start | Start destination |
+| POST | /api/v1/outputs/{id}/stop | Stop destination |
+| GET | /api/v1/scenes | Selectable OBS scenes |
+| GET | /api/v1/encoders | Available H.264 encoder IDs |
+| GET | /api/v1/matrix | Audio sources and mixer bitmask |
+| PUT | /api/v1/matrix/{source-uuid} | Set 16-bit mixer mask |
+| GET | /api/v1/groups | Groups |
+| POST | /api/v1/groups/{group}/start | Start group |
+| POST | /api/v1/groups/{group}/stop | Stop group |
+| GET | /api/v1/presets | List presets |
+| POST | /api/v1/presets/save | Save a preset by name |
+| POST | /api/v1/presets/load | Load preset while streams stopped |
+| DELETE | /api/v1/presets/{name} | Delete preset |
 
-Example (set token from the local config file, do not paste secrets into tickets):
+PATCH /api/v1/outputs/rtmp-01/config example:
 
-\`\`\`sh
-curl -H "Authorization: Bearer $OBS_MATRIX_TOKEN" \
-  http://127.0.0.1:4456/api/v1/status
-\`\`\`
+    {
+      "name": "Deutsch",
+      "server": "rtmps://server.example/live",
+      "key": "PRIVATE_KEY",
+      "audioMix": 8,
+      "videoSourceUuid": "",
+      "videoEncoderId": "obs_x264",
+      "group": "language",
+      "videoBitrate": 3500,
+      "audioBitrate": 160,
+      "backupServer": "rtmps://backup.example/live",
+      "backupKey": "BACKUP_KEY",
+      "failoverEnabled": true
+    }
 
-\`\`\`sh
-curl -X PATCH \
-  -H "Authorization: Bearer $OBS_MATRIX_TOKEN" \
-  -H "Content-Type: application/json" \
-  -d '{"server":"rtmps://example.invalid/live","key":"YOUR_KEY","audioMix":2}' \
-  http://127.0.0.1:4456/api/v1/outputs/rtmp-01/config
-\`\`\`
+Routing mask examples: bus 1 = 1, bus 8 = 128, all 16 buses = 65535.
+Video scene UUIDs come from GET /api/v1/scenes; empty string selects Program.
+Configuration of a running output requires stop and reconnect.
 
-Note: restarting an RTMP connection is required for URL/key changes on a live output.
-Route changes use OBS's live source mixer flags. These mixer flags belong to the OBS
-session and can also be affected by the OBS Advanced Audio Properties UI.
+WebSocket status: connect to ws://127.0.0.1:4457/events using the requested
+subprotocol matrix.YOUR_API_TOKEN. It publishes one full status JSON about every second.
+The local browser dashboard handles this automatically.
 
-## Development and validation
+## Security and production limitations
 
-This branch modifies:
-- \`frontend/matrix/MatrixController.hpp/.cpp\`
-- \`frontend/matrix/MatrixDock.hpp/.cpp\`
-- \`frontend/widgets/OBSBasic.cpp\`
-- \`frontend/cmake/ui-widgets.cmake\`
+The API accepts loopback connections only. Never expose either port directly
+to the public internet. For remote use, put it behind a trusted tunnel. The
+current HTTP/WebSocket servers are prototypes, not audited production transports.
+Windows DPAPI binds encrypted secrets to the OS user; keep secure Windows
+account access. The token is only shown/copyable from the local Matrix dock.
 
-Build and test with the repository's existing CMake presets and platform dependencies.
-The branch has not yet passed a full OBS build or functional broadcast test.
-Test on a non-production installation and an RTMP endpoint under your control.
+The initial 64-output ceiling is a configuration limit, NOT a guarantee that
+a Windows PC can encode and upload 64 separate streams. Validate available
+NVENC/AMF/QSV sessions, CPU, GPU and network bandwidth for each configuration.
 
-## Next milestones
+The 16 buses are global audio mixers, not 16 fully independent audio
+capture/processing engines. Per-scene audio isolation, separate per-output
+audio effects/monitoring devices, perceptual loudness, multi-host failover,
+automatic failback and unconditional zero-downtime output switching are still
+unimplemented. Encoder sharing for nonidentical scene views is also not supported.
 
-1. Verify Windows/Linux/macOS builds and add tests for start/stop, audio routing, and HTTP validation.
-2. Harden HTTP parsing, authentication, and key storage (OS credential vault).
-3. Improve output lifecycle handling, reconnection events, per-target telemetry, and saved source routing.
-4. Implement shared/hardware encoding, capacity planning and load alerts for large output counts.
-5. Add independent video buses and per-output scene routing if required.
+Preset load does not yet provide atomic rollback across all outputs.
+The WebSocket is currently status-only; modification commands use REST.
+The audit logger stores paths and timestamps, not secrets.
 
-## Target architecture (not yet implemented)
+## Windows-only build & test
 
-- **8+ truly independent audio buses:** OBS's native standard mix API provides six track mixer flags. Destinations seven and eight currently reuse tracks; distinct buses beyond six require an additional audio-mixing architecture, not just new RTMP outputs.
-- **Independent video routes:** selectable scene, source/canvas, transition and encoder per RTMP destination, with optional encoder sharing when pictures and settings match.
-- **Professional broadcast monitoring:** per-output bitrate, dropped frames, link latency, audio meters, silence detection, stream-health alerts, backup URL and automatic failover.
-- **Production controls:** API WebSocket event feed, bulk start/stop, presets, source-routing persistence, read-only status tokens, audit log, output groups and hotkeys.
-- **Safety:** Windows DPAPI/credential vault for keys, throttled authenticated API, exact target URL validation, and hardened HTTP transport.
+GitHub Actions workflow:
+.github/workflows/matrix-studio-ci.yaml
 
-These features remain roadmap goals, not claims about the current prototype.
+Download successful artifacts at:
+https://github.com/Giantturning/obs-studio/actions
+
+Acceptance tests:
+1. Build Windows x64 in GitHub Actions; ZIP artifact exists.
+2. Start from extracted Windows build and check the Matrix Control dock.
+3. Route distinct test tones to buses 1, 8 and 16, check isolation and silence flags.
+4. Connect two RTMP outputs to independent scenes; confirm images differ.
+5. Test primary/backup RTMP failure, output-group start/stop and preset persistence.
+6. Validate WebSocket auth, REST API auth, DPAPI secrets, status and audit log.
+7. Confirm CPU/GPU/network capacity for eight simultaneous live streams.
+8. Test Windows shutdown while outputs are active; no crashes or handle leaks.
