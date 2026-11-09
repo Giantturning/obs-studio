@@ -18,6 +18,7 @@ public:
     ~MatrixDock() override;
 private:
     void refresh();
+    void populateOutputs();
     void updateRoute(int row, int track, bool selected);
     void acceptConnection();
     void processRequest(QTcpSocket *socket);
