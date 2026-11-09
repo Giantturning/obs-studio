@@ -44,9 +44,8 @@ function Package {
 
     Install-BuildDependencies -WingetFile "${ScriptHome}/.Wingetfile"
 
-    # An OBS fork might not have a semantic-version tag yet.
-    # --always keeps git describe successful even with no tags.
-    $GitDescription = Invoke-External git describe --tags --long --always
+    # Fork builds do not necessarily have a version tag.
+    $GitDescription = (Invoke-External git describe --tags --long --always).Trim()
     if ( $GitDescription -match '^(.+)-([0-9]+)-g([0-9a-fA-F]+)
 
     if ( $CommitDistance -gt 0 ) {
