@@ -510,6 +510,11 @@ table{border-collapse:collapse;width:100%;min-width:860px}td,th{text-align:left;
 <div><input id="token" type="password" placeholder="Paste local API token">
 <button onclick="connect()">Connect</button></div></header>
 <p id="message" class="warn">Enter apiToken from OBSMatrixStudio.ini to connect.</p>
+<section class="panel"><h2>Main OBS Program</h2><div id="program"></div>
+<button onclick="mainAction('stream/start')">Start OBS stream</button>
+<button onclick="mainAction('stream/stop')">Stop OBS stream</button>
+<button onclick="mainAction('record/start')">Start recording</button>
+<button onclick="mainAction('record/stop')">Stop recording</button></section>
 <section class="panel"><h2>RTMP outputs</h2><table><thead><tr><th>Name</th>
 <th>Video scene UUID</th><th>Bus</th><th>Group</th><th>Bitrate</th>
 <th>Dropped</th><th>State</th><th>Controls</th></tr></thead>
@@ -532,6 +537,9 @@ async function api(path,method='GET',body=undefined){
 }
 function render(data){
   lastStatus=data;
+  const p=data.program||{};
+  document.getElementById('program').textContent='Scene: '+(p.programSceneName||'None')+
+    ' | OBS streaming: '+Boolean(p.streaming)+' | Recording: '+Boolean(p.recording);
   document.getElementById('systemStats').textContent=
     'OBS CPU: '+Math.round(data.cpuPercent||0)+'% | Memory: '+
     Math.round(data.processMemoryMb||0)+' MB | Active destinations: '+
@@ -573,6 +581,10 @@ async function groupAction(action){try{
  const data=await api('groups/'+encodeURIComponent(group)+'/'+action,'POST');
  document.getElementById('message').textContent=JSON.stringify(data);render(await api('status'));
 }catch(e){document.getElementById('message').textContent=e.message;}}
+async function mainAction(action){
+ try{await api('program/'+action,'POST');render(await api('status'))}
+ catch(e){document.getElementById('message').textContent=e.message;}
+}
 async function editOutput(id){
   if(!lastStatus)return;
   const o=(lastStatus.matrixOutputs||[]).find(x=>x.id===id);if(!o)return;
@@ -716,6 +728,33 @@ void MatrixDock::dispatch(QTcpSocket *socket, const QByteArray &method, const QB
                 log.write(stamp + " " + method + " " + path + "\n");
             }
         }
+    }
+    if (method == "GET" && path == "/api/v1/program") {
+        reply(socket, 200, controller->mainStatus());
+        return;
+    }
+    if (method == "POST" && path == "/api/v1/program/scene") {
+        QString error;
+        const bool ok = controller->setProgramScene(payload.value("uuid").toString(), error);
+        reply(socket, ok ? 200 : 400, ok ? QJsonObject{{"ok", true}} : QJsonObject{{"error", error}});
+        refresh();
+        return;
+    }
+    if (method == "PATCH" && path.startsWith("/api/v1/audio/")) {
+        const QString id = QString::fromUtf8(path.mid(sizeof("/api/v1/audio/") - 1));
+        QString error;
+        const bool ok = controller->controlAudioSource(id, payload, error);
+        reply(socket, ok ? 200 : 400, ok ? QJsonObject{{"ok", true}} : QJsonObject{{"error", error}});
+        refresh();
+        return;
+    }
+    if (method == "POST" && path.startsWith("/api/v1/program/")) {
+        const QString action = QString::fromUtf8(path.mid(sizeof("/api/v1/program/") - 1));
+        QString error;
+        const bool ok = controller->controlMain(action, error);
+        reply(socket, ok ? 200 : 400, ok ? QJsonObject{{"ok", true}} : QJsonObject{{"error", error}});
+        refresh();
+        return;
     }
     if (method == "GET" && path == "/api/v1/health") {
         const QJsonArray all = controller->outputs();
