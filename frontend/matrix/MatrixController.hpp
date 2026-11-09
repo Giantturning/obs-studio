@@ -27,6 +27,10 @@ public:
     QJsonArray groups() const;
     QJsonArray presets() const;
     QJsonObject status() const;
+    QJsonObject mainStatus() const;
+    bool controlMain(const QString &action, QString &error);
+    bool setProgramScene(const QString &uuid, QString &error);
+    bool controlAudioSource(const QString &uuid, const QJsonObject &changes, QString &error);
     bool addOutput(QString &id, QString &error);
     bool removeOutput(const QString &id, QString &error);
     bool configure(const QString &id, const QJsonObject &changes, QString &error);
