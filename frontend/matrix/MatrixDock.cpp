@@ -5,6 +5,8 @@
 
 #include <QAbstractItemView>
 #include <QCheckBox>
+#include <QClipboard>
+#include <QGuiApplication>
 #include <QComboBox>
 #include <QCryptographicHash>
 #include <QInputDialog>
@@ -144,13 +146,32 @@ MatrixDock::MatrixDock(QWidget *parent) : QDockWidget("Matrix Control", parent),
     layout->addWidget(apiLabel);
     if (server->listen(QHostAddress::LocalHost, 4456)) {
         apiLabel->setText("Local control API: http://127.0.0.1:4456/api/v1/status"
-                          "\nToken in per-user OBSMatrixStudio.ini under apiToken."
-                          "\nHeader: Authorization: Bearer <token>");
+                          "\nHeader: Authorization: Bearer <token> (encrypted at rest)");
         connect(server, &QTcpServer::newConnection, this, &MatrixDock::acceptConnection);
     } else {
         apiLabel->setText("API unavailable: " + server->errorString());
     }
 
+    auto *apiTokenRow = new QWidget(root);
+    auto *apiTokenLayout = new QHBoxLayout(apiTokenRow);
+    apiTokenLayout->setContentsMargins(0, 0, 0, 0);
+    auto *tokenEdit = new QLineEdit(apiToken, apiTokenRow);
+    tokenEdit->setEchoMode(QLineEdit::Password);
+    tokenEdit->setReadOnly(true);
+    auto *toggleToken = new QPushButton("Show token", apiTokenRow);
+    auto *copyToken = new QPushButton("Copy token", apiTokenRow);
+    apiTokenLayout->addWidget(tokenEdit);
+    apiTokenLayout->addWidget(toggleToken);
+    apiTokenLayout->addWidget(copyToken);
+    layout->addWidget(apiTokenRow);
+    connect(toggleToken, &QPushButton::clicked, this, [tokenEdit, toggleToken]() {
+        const bool visible = tokenEdit->echoMode() != QLineEdit::Normal;
+        tokenEdit->setEchoMode(visible ? QLineEdit::Normal : QLineEdit::Password);
+        toggleToken->setText(visible ? "Hide token" : "Show token");
+    });
+    connect(copyToken, &QPushButton::clicked, this, [this]() {
+        QGuiApplication::clipboard()->setText(apiToken);
+    });
     if (websocketServer->listen(QHostAddress::LocalHost, 4457))
         connect(websocketServer, &QTcpServer::newConnection, this, &MatrixDock::acceptWebSocket);
     auto *dashboardLink = new QLabel(
