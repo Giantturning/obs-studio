@@ -1,5 +1,6 @@
 // OBS Matrix Studio: native multi-RTMP controller (GPL-2.0-or-later).
 #include "MatrixController.hpp"
+#include "MatrixSecrets.hpp"
 
 #include <utility/audio-encoders.hpp>
 #include <obs-frontend-api.h>
@@ -74,12 +75,12 @@ MatrixController::MatrixController(QObject *parent) : QObject(parent)
         settings.beginGroup(id);
         d->name = settings.value("name", QString("Output %1").arg(numericId)).toString();
         d->server = settings.value("server").toString();
-        d->key = settings.value("key").toString();
+        d->key = MatrixSecrets::unprotect(settings.value("key").toString());
         d->audioMix = qBound(0, settings.value("audioMix", int((numericId - 1) % 16)).toInt(), 15);
         d->videoSourceUuid = settings.value("videoSourceUuid").toString();
         d->group = settings.value("group", "default").toString();
         d->backupServer = settings.value("backupServer").toString();
-        d->backupKey = settings.value("backupKey").toString();
+        d->backupKey = MatrixSecrets::unprotect(settings.value("backupKey").toString());
         d->failoverEnabled = settings.value("failoverEnabled", false).toBool();
         d->videoBitrate = qBound(500, settings.value("videoBitrate", 3500).toInt(), 50000);
         d->audioBitrate = qBound(64, settings.value("audioBitrate", 160).toInt(), 320);
@@ -202,14 +203,14 @@ void MatrixController::save() const
         settings.beginGroup(d.id);
         settings.setValue("name", d.name);
         settings.setValue("server", d.server);
-        settings.setValue("key", d.key);
+        settings.setValue("key", MatrixSecrets::protect(d.key));
         settings.setValue("audioMix", d.audioMix);
         settings.setValue("videoBitrate", d.videoBitrate);
         settings.setValue("audioBitrate", d.audioBitrate);
         settings.setValue("videoSourceUuid", d.videoSourceUuid);
         settings.setValue("group", d.group);
         settings.setValue("backupServer", d.backupServer);
-        settings.setValue("backupKey", d.backupKey);
+        settings.setValue("backupKey", MatrixSecrets::protect(d.backupKey));
         settings.setValue("failoverEnabled", d.failoverEnabled);
         settings.endGroup();
     }
