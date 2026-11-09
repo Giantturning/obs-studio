@@ -31,6 +31,7 @@ public:
     bool configure(const QString &id, const QJsonObject &changes, QString &error);
     bool start(const QString &id, QString &error);
     bool stop(const QString &id, QString &error);
+    bool switchScene(const QString &id, const QString &sceneUuid, QString &error);
     bool routeSource(const QString &uuid, int mixers, QString &error);
     QJsonObject startGroup(const QString &group);
     QJsonObject stopGroup(const QString &group);
