@@ -44,10 +44,13 @@ MatrixController::MatrixController(QObject *parent) : QObject(parent)
 
     // Keep previously saved outputs; initialize eight destinations on a new install.
     QStringList ids = settings.childGroups();
-    for (int i = 1; i <= 8; ++i) {
-        const QString id = QString("rtmp-%1").arg(i, 2, 10, QLatin1Char('0'));
-        if (!ids.contains(id))
-            ids.append(id);
+    if (!settings.value("outputsInitialized", false).toBool()) {
+        for (int i = 1; i <= 8; ++i) {
+            const QString id = QString("rtmp-%1").arg(i, 2, 10, QLatin1Char('0'));
+            if (!ids.contains(id))
+                ids.append(id);
+        }
+        settings.setValue("outputsInitialized", true);
     }
     ids.removeDuplicates();
     std::sort(ids.begin(), ids.end(), [](const QString &a, const QString &b) {
