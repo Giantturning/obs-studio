@@ -21,6 +21,7 @@ public:
     QJsonArray outputs() const;
     QJsonArray sources() const;
     QJsonArray scenes() const;
+    QJsonArray videoEncoders() const;
     QJsonArray audioMeters() const;
     QJsonArray groups() const;
     QJsonArray presets() const;
@@ -46,6 +47,7 @@ private:
         QString key;
         int audioMix = 0; // OBS mixer index (0..15); fork has 16 independent buses.
         int videoBitrate = 3500; // kbps
+        QString videoEncoderId = "obs_x264"; // Can be NVENC, AMF or QSV if installed.
         int audioBitrate = 160; // kbps
         QString videoSourceUuid; // empty means the main OBS program video
         QString group = "default";
