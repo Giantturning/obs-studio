@@ -4,6 +4,7 @@
 #include <QDockWidget>
 #include <QHash>
 #include <QJsonObject>
+#include <QSet>
 
 class QTcpServer;
 class QTcpSocket;
@@ -25,10 +26,15 @@ private:
     void reply(QTcpSocket *socket, int code, const QJsonObject &data);
     void dispatch(QTcpSocket *socket, const QByteArray &method, const QByteArray &path,
                   const QJsonObject &payload);
+    void replyHtml(QTcpSocket *socket);
+    void acceptWebSocket();
+    void broadcastStatus();
     MatrixController *controller;
     QTableWidget *routesTable;
     QTableWidget *outputsTable;
     QTcpServer *server;
+    QTcpServer *websocketServer;
+    QSet<QTcpSocket *> websocketClients;
     QTimer *refreshTimer;
     QString apiToken;
     QHash<QTcpSocket *, QByteArray> pending;
