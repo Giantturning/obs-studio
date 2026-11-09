@@ -243,7 +243,7 @@ void MatrixDock::processRequest(QTcpSocket *socket)
                 return;
             }
         }
-        if (line.startsWith("Authorization:", Qt::CaseInsensitive)) {
+        if (line.left(14).compare("Authorization:", Qt::CaseInsensitive) == 0) {
             const QByteArray presented = line.mid(line.indexOf(':') + 1).trimmed();
             authenticated = presented == ("Bearer " + apiToken.toUtf8());
         }
