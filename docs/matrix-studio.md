@@ -5,7 +5,7 @@ It is an early prototype, not a verified production-ready broadcast system.
 
 ## Scope
 
-- Four independently managed RTMP/RTMPS outputs with a shared OBS program video.
+- Eight independently managed RTMP/RTMPS outputs by default, with add/remove support (up to 64 configured destinations). All currently share the OBS program video.
 - Each destination selects one of OBS's existing six audio mixers.
 - Six-track source routing matrix using OBS's native \`obs_source_set_audio_mixers\`.
 - Built-in Qt dock with per-output server, key, track, start/stop, and status.
@@ -13,7 +13,7 @@ It is an early prototype, not a verified production-ready broadcast system.
 - Per-user settings stored by QSettings (Giantturning / OBSMatrixStudio).
 
 The RTMP output encoder currently uses **x264 software encoding** for each destination.
-Four concurrent encoders can require substantial CPU. Hardware encoders, encoder sharing,
+Eight or more concurrent encoders can require substantial CPU; the limit of 64 is a configuration ceiling, not a performance guarantee. Hardware encoders, encoder sharing,
 per-output scene/video routing, resilient state management, and enhanced credential
 storage are planned improvements, not implemented features.
 
@@ -37,6 +37,8 @@ All requests require \`Authorization: Bearer <apiToken>\` and JSON request bodie
 | --- | --- | --- |
 | GET | /api/v1/status | Main stream status, outputs, audio sources |
 | GET | /api/v1/outputs | RTMP states and destinations (no keys) |
+| POST | /api/v1/outputs | Create a new output (returns its id) |
+| DELETE | /api/v1/outputs/{id} | Remove a stopped output |
 | GET | /api/v1/matrix | Audio source UUIDs and 6-bit routing masks |
 | PATCH | /api/v1/outputs/rtmp-01/config | Set name, server, key, audioMix (1–6), videoBitrate, audioBitrate |
 | POST | /api/v1/outputs/rtmp-01/start | Start one output |
@@ -79,5 +81,15 @@ Test on a non-production installation and an RTMP endpoint under your control.
 1. Verify Windows/Linux/macOS builds and add tests for start/stop, audio routing, and HTTP validation.
 2. Harden HTTP parsing, authentication, and key storage (OS credential vault).
 3. Improve output lifecycle handling, reconnection events, per-target telemetry, and saved source routing.
-4. Support shared/hardware encoding and dynamically configurable output counts.
+4. Implement shared/hardware encoding, capacity planning and load alerts for large output counts.
 5. Add independent video buses and per-output scene routing if required.
+
+## Target architecture (not yet implemented)
+
+- **8+ truly independent audio buses:** OBS's native standard mix API provides six track mixer flags. Destinations seven and eight currently reuse tracks; distinct buses beyond six require an additional audio-mixing architecture, not just new RTMP outputs.
+- **Independent video routes:** selectable scene, source/canvas, transition and encoder per RTMP destination, with optional encoder sharing when pictures and settings match.
+- **Professional broadcast monitoring:** per-output bitrate, dropped frames, link latency, audio meters, silence detection, stream-health alerts, backup URL and automatic failover.
+- **Production controls:** API WebSocket event feed, bulk start/stop, presets, source-routing persistence, read-only status tokens, audit log, output groups and hotkeys.
+- **Safety:** Windows DPAPI/credential vault for keys, throttled authenticated API, exact target URL validation, and hardened HTTP transport.
+
+These features remain roadmap goals, not claims about the current prototype.
