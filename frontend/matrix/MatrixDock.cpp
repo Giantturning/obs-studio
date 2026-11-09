@@ -6,6 +6,8 @@
 #include <QCheckBox>
 #include <QFormLayout>
 #include <QHeaderView>
+#include <QHBoxLayout>
+#include <QMessageBox>
 #include <QHostAddress>
 #include <QJsonArray>
 #include <QJsonDocument>
@@ -59,7 +61,61 @@ MatrixDock::MatrixDock(QWidget *parent) : QDockWidget("Matrix Control", parent),
     outputsTable->horizontalHeader()->setSectionResizeMode(QHeaderView::ResizeToContents);
     outputsTable->horizontalHeader()->setSectionResizeMode(1, QHeaderView::Stretch);
     outputsTable->verticalHeader()->hide();
-    outputsTable->setRowCount(4);
+    layout->addWidget(outputsTable);
+    auto *addOutputButton = new QPushButton("Add RTMP output", root);
+    layout->addWidget(addOutputButton);
+    connect(addOutputButton, &QPushButton::clicked, this, [this]() {
+        QString id;
+        QString error;
+        if (!controller->addOutput(id, error)) {
+            QMessageBox::warning(this, "Matrix Control", error);
+            return;
+        }
+        populateOutputs();
+        refresh();
+    });
+
+
+    QSettings settings(QSettings::IniFormat, QSettings::UserScope, "Giantturning", "OBSMatrixStudio");
+    apiToken = settings.value("apiToken").toString();
+    if (apiToken.size() < 32) {
+        apiToken = generateToken();
+        settings.setValue("apiToken", apiToken);
+        settings.sync();
+    }
+    auto *apiLabel = new QLabel(root);
+    apiLabel->setTextInteractionFlags(Qt::TextSelectableByMouse);
+    apiLabel->setWordWrap(true);
+    layout->addWidget(apiLabel);
+    if (server->listen(QHostAddress::LocalHost, 4456)) {
+        apiLabel->setText("Local control API: http://127.0.0.1:4456/api/v1/status"
+                          "\nToken in per-user OBSMatrixStudio.ini under apiToken."
+                          "\nHeader: Authorization: Bearer <token>");
+        connect(server, &QTcpServer::newConnection, this, &MatrixDock::acceptConnection);
+    } else {
+        apiLabel->setText("API unavailable: " + server->errorString());
+    }
+
+    setWidget(root);
+    populateOutputs();
+    refreshTimer->setInterval(1000);
+    connect(refreshTimer, &QTimer::timeout, this, &MatrixDock::refresh);
+    refreshTimer->start();
+    refresh();
+}
+
+MatrixDock::~MatrixDock()
+{
+    refreshTimer->stop();
+    server->close();
+    for (QTcpSocket *socket : pending.keys())
+        socket->abort();
+}
+
+void MatrixDock::populateOutputs()
+{
+    outputsTable->setRowCount(0);
+    outputsTable->setRowCount(controller->outputs().size());
     const QJsonArray configured = controller->outputs();
     for (int row = 0; row < configured.size(); ++row) {
         const QJsonObject output = configured[row].toObject();
@@ -74,12 +130,27 @@ MatrixDock::MatrixDock(QWidget *parent) : QDockWidget("Matrix Control", parent),
         track->setValue(output.value("audioMix").toInt());
         auto *state = new QLabel("Stopped", outputsTable);
         auto *button = new QPushButton("Start", outputsTable);
+        auto *remove = new QPushButton("Delete", outputsTable);
+        auto *control = new QWidget(outputsTable);
+        auto *buttons = new QHBoxLayout(control);
+        buttons->setContentsMargins(0, 0, 0, 0);
+        buttons->addWidget(button);
+        buttons->addWidget(remove);
         outputsTable->setCellWidget(row, 0, name);
         outputsTable->setCellWidget(row, 1, url);
         outputsTable->setCellWidget(row, 2, key);
         outputsTable->setCellWidget(row, 3, track);
         outputsTable->setCellWidget(row, 4, state);
-        outputsTable->setCellWidget(row, 5, button);
+        outputsTable->setCellWidget(row, 5, control);
+        connect(remove, &QPushButton::clicked, this, [this, id]() {
+            QString error;
+            if (!controller->removeOutput(id, error)) {
+                QMessageBox::warning(this, "Matrix Control", error);
+                return;
+            }
+            populateOutputs();
+            refresh();
+        });
 
         connect(button, &QPushButton::clicked, this, [this, id, name, url, key, track, state]() {
             QString error;
@@ -106,41 +177,7 @@ MatrixDock::MatrixDock(QWidget *parent) : QDockWidget("Matrix Control", parent),
             refresh();
         });
     }
-    layout->addWidget(outputsTable);
 
-    QSettings settings(QSettings::IniFormat, QSettings::UserScope, "Giantturning", "OBSMatrixStudio");
-    apiToken = settings.value("apiToken").toString();
-    if (apiToken.size() < 32) {
-        apiToken = generateToken();
-        settings.setValue("apiToken", apiToken);
-        settings.sync();
-    }
-    auto *apiLabel = new QLabel(root);
-    apiLabel->setTextInteractionFlags(Qt::TextSelectableByMouse);
-    apiLabel->setWordWrap(true);
-    layout->addWidget(apiLabel);
-    if (server->listen(QHostAddress::LocalHost, 4456)) {
-        apiLabel->setText("Local control API: http://127.0.0.1:4456/api/v1/status"
-                          "\nToken in per-user OBSMatrixStudio.ini under apiToken."
-                          "\nHeader: Authorization: Bearer <token>");
-        connect(server, &QTcpServer::newConnection, this, &MatrixDock::acceptConnection);
-    } else {
-        apiLabel->setText("API unavailable: " + server->errorString());
-    }
-
-    setWidget(root);
-    refreshTimer->setInterval(1000);
-    connect(refreshTimer, &QTimer::timeout, this, &MatrixDock::refresh);
-    refreshTimer->start();
-    refresh();
-}
-
-MatrixDock::~MatrixDock()
-{
-    refreshTimer->stop();
-    server->close();
-    for (QTcpSocket *socket : pending.keys())
-        socket->abort();
 }
 
 void MatrixDock::refresh()
@@ -173,7 +210,10 @@ void MatrixDock::refresh()
     for (int row = 0; row < outputs.size(); ++row) {
         const QJsonObject output = outputs[row].toObject();
         auto *state = qobject_cast<QLabel *>(outputsTable->cellWidget(row, 4));
-        auto *button = qobject_cast<QPushButton *>(outputsTable->cellWidget(row, 5));
+        auto *control = outputsTable->cellWidget(row, 5);
+        auto *button = control ? control->findChild<QPushButton *>() : nullptr;
+        if (!state || !button)
+            continue;
         const bool active = output.value("active").toBool();
         const bool reconnecting = output.value("reconnecting").toBool();
         state->setText(reconnecting ? "Reconnecting" : active ? "LIVE" : "Stopped");
@@ -302,6 +342,34 @@ void MatrixDock::dispatch(QTcpSocket *socket, const QByteArray &method, const QB
             reply(socket, 400, QJsonObject{{"error", error}});
         } else {
             reply(socket, 200, QJsonObject{{"ok", true}});
+            refresh();
+        }
+        return;
+    }
+    if (method == "POST" && path == "/api/v1/outputs") {
+        QString id;
+        QString error;
+        if (!controller->addOutput(id, error)) {
+            reply(socket, 400, QJsonObject{{"error", error}});
+        } else {
+            reply(socket, 200, QJsonObject{{"ok", true}, {"id", id}});
+            populateOutputs();
+            refresh();
+        }
+        return;
+    }
+    if (method == "DELETE" && path.startsWith("/api/v1/outputs/")) {
+        const QByteArray id = path.mid(sizeof("/api/v1/outputs/") - 1);
+        if (id.isEmpty() || id.contains('/')) {
+            reply(socket, 400, QJsonObject{{"error", "Invalid output ID"}});
+            return;
+        }
+        QString error;
+        if (!controller->removeOutput(QString::fromUtf8(id), error)) {
+            reply(socket, 400, QJsonObject{{"error", error}});
+        } else {
+            reply(socket, 200, QJsonObject{{"ok", true}});
+            populateOutputs();
             refresh();
         }
         return;
