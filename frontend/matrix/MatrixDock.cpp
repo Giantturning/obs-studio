@@ -138,9 +138,11 @@ MatrixDock::MatrixDock(QWidget *parent) : QDockWidget("Matrix Control", parent),
     });
 
     QSettings settings(QSettings::IniFormat, QSettings::UserScope, "Giantturning", "OBSMatrixStudio");
-    apiToken = MatrixSecrets::unprotect(settings.value("apiToken").toString());
-    if (apiToken.size() < 32) {
+    const QString storedToken = settings.value("apiToken").toString();
+    apiToken = MatrixSecrets::unprotect(storedToken);
+    if (apiToken.size() < 32)
         apiToken = generateToken();
+    if (!storedToken.startsWith("dpapi:") || storedToken.isEmpty()) {
         settings.setValue("apiToken", MatrixSecrets::protect(apiToken));
         settings.sync();
     }
