@@ -261,6 +261,22 @@ void MatrixDock::populateOutputs()
         outputsTable->setCellWidget(row, 9, failover);
         outputsTable->setCellWidget(row, 10, state);
         outputsTable->setCellWidget(row, 11, control);
+        connect(scene, QOverload<int>::of(&QComboBox::currentIndexChanged), this, [this, id, scene](int) {
+            bool active = false;
+            for (const auto &value : controller->outputs()) {
+                const QJsonObject output = value.toObject();
+                if (output.value("id").toString() == id) {
+                    active = output.value("active").toBool();
+                    break;
+                }
+            }
+            if (active) {
+                QString error;
+                if (!controller->switchScene(id, scene->currentData().toString(), error))
+                    QMessageBox::warning(this, "Scene routing", error);
+                refresh();
+            }
+        });
         connect(remove, &QPushButton::clicked, this, [this, id]() {
             QString error;
             if (!controller->removeOutput(id, error)) {
@@ -826,6 +842,8 @@ void MatrixDock::dispatch(QTcpSocket *socket, const QByteArray &method, const QB
             ok = controller->stop(id, error);
         else if (method == "PATCH" && parts[5] == "config")
             ok = controller->configure(id, payload, error);
+        else if (method == "POST" && parts[5] == "scene")
+            ok = controller->switchScene(id, payload.value("videoSourceUuid").toString(), error);
         else {
             reply(socket, 404, QJsonObject{{"error", "Unknown endpoint"}});
             return;
