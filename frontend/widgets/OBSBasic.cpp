@@ -247,11 +247,6 @@ OBSBasic::OBSBasic(QWidget *parent) : OBSMainWindow(parent), undo_s(ui), ui(new 
 	resizeDocks({ui->scenesDock, ui->sourcesDock}, {sideDockWidth, sideDockWidth}, Qt::Horizontal);
 	addDockWidget(Qt::BottomDockWidgetArea, controlsDock);
 
-	// Matrix routing is a built-in feature of this OBS distribution.
-	MatrixDock *matrixDock = new MatrixDock(this);
-	addDockWidget(Qt::RightDockWidgetArea, matrixDock);
-	ui->menuDocks->addAction(matrixDock->toggleViewAction());
-
 	startingDockLayout = saveState();
 
 	statsDock = new OBSDock();
@@ -1242,6 +1237,11 @@ void OBSBasic::OBSInit()
 	if (safe_mode) {
 		ui->actionRestartSafe->setText(QTStr("Basic.MainMenu.Help.RestartNormal"));
 	}
+
+	// Built-in Matrix Studio: initialize only after libobs is ready.
+	MatrixDock *matrixDock = new MatrixDock(this);
+	addDockWidget(Qt::RightDockWidgetArea, matrixDock);
+	ui->menuDocks->addAction(matrixDock->toggleViewAction());
 
 	UpdatePreviewProgramIndicators();
 	OnFirstLoad();
