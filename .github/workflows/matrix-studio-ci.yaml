@@ -1,8 +1,9 @@
-name: Matrix Studio CI
-run-name: Matrix Studio - ${{ github.ref_name }}
+name: Matrix Studio Windows CI
+run-name: Windows x64 - ${{ github.ref_name }}
 on:
   push:
     branches:
+      - master
       - feature/native-matrix-control
   pull_request:
     branches:
@@ -10,22 +11,13 @@ on:
   workflow_dispatch:
 permissions:
   contents: read
+concurrency:
+  group: matrix-studio-windows-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
 jobs:
-  matrix-build:
-    name: Build ${{ matrix.platform }}
-    runs-on: ${{ matrix.runner }}
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - platform: windows-x64
-            runner: windows-2025-vs2026
-            target: x64
-            config: RelWithDebInfo
-          - platform: ubuntu-x86_64
-            runner: ubuntu-26.04
-            target: x86_64
-            config: RelWithDebInfo
+  windows-x64:
+    name: Windows x64 Build
+    runs-on: windows-2025-vs2026
     steps:
       - name: Checkout with submodules
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -33,31 +25,22 @@ jobs:
           submodules: recursive
           fetch-depth: 0
 
-      - name: Build OBS Studio
+      - name: Build OBS Studio (Windows x64)
         uses: ./.github/actions/build-obs
         with:
-          target: ${{ matrix.target }}
-          config: ${{ matrix.config }}
+          target: x64
+          config: RelWithDebInfo
 
-      - name: Package test build
+      - name: Package Windows x64
         uses: ./.github/actions/package-obs
         with:
-          target: ${{ matrix.target }}
-          config: ${{ matrix.config }}
+          target: x64
+          config: RelWithDebInfo
           package: true
 
-      - name: Upload Windows build
-        if: runner.os == 'Windows'
+      - name: Upload Windows x64 ZIP
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: matrix-studio-windows-x64
           path: build_x64/obs-studio-*-windows-x64.zip
-          if-no-files-found: error
-
-      - name: Upload Linux build
-        if: runner.os == 'Linux'
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        with:
-          name: matrix-studio-linux-x86_64
-          path: build_ubuntu/obs-studio-*-x86_64-ubuntu-gnu.*
           if-no-files-found: error
