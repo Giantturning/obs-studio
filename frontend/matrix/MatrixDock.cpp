@@ -9,6 +9,10 @@
 #include <QGuiApplication>
 #include <QComboBox>
 #include <QCryptographicHash>
+#include <QDateTime>
+#include <QDir>
+#include <QFile>
+#include <QStandardPaths>
 #include <QInputDialog>
 #include <QFormLayout>
 #include <QHeaderView>
@@ -363,7 +367,16 @@ void MatrixDock::acceptConnection()
 {
     while (server->hasPendingConnections()) {
         QTcpSocket *socket = server->nextPendingConnection();
+        if (pending.size() >= 32) {
+            socket->abort();
+            socket->deleteLater();
+            continue;
+        }
         pending.insert(socket, {});
+        QTimer::singleShot(7000, socket, [socket]() {
+            if (socket->state() == QAbstractSocket::ConnectedState)
+                socket->disconnectFromHost();
+        });
         connect(socket, &QTcpSocket::readyRead, this, [this, socket]() { processRequest(socket); });
         connect(socket, &QTcpSocket::disconnected, this, [this, socket]() {
             pending.remove(socket);
@@ -559,7 +572,17 @@ void MatrixDock::acceptWebSocket()
 {
     while (websocketServer->hasPendingConnections()) {
         QTcpSocket *socket = websocketServer->nextPendingConnection();
+        if (websocketClients.size() >= 16) {
+            socket->abort();
+            socket->deleteLater();
+            continue;
+        }
         auto *buffer = new QByteArray;
+        QTimer::singleShot(7000, socket, [this, socket]() {
+            if (!websocketClients.contains(socket) &&
+                socket->state() == QAbstractSocket::ConnectedState)
+                socket->disconnectFromHost();
+        });
         connect(socket, &QTcpSocket::disconnected, this, [this, socket, buffer]() {
             websocketClients.remove(socket);
             delete buffer;
@@ -646,6 +669,39 @@ void MatrixDock::broadcastStatus()
 void MatrixDock::dispatch(QTcpSocket *socket, const QByteArray &method, const QByteArray &path,
                           const QJsonObject &payload)
 {
+    // Audit actions without writing credentials, payloads or bearer tokens.
+    if (method != "GET") {
+        const QString directory = QStandardPaths::writableLocation(QStandardPaths::AppDataLocation);
+        if (!directory.isEmpty() && QDir().mkpath(directory)) {
+            QFile log(directory + "/matrix-audit.log");
+            if (log.open(QIODevice::WriteOnly | QIODevice::Append | QIODevice::Text)) {
+                const QByteArray stamp = QDateTime::currentDateTimeUtc().toString(Qt::ISODate).toUtf8();
+                log.write(stamp + " " + method + " " + path + "\n");
+            }
+        }
+    }
+    if (method == "GET" && path == "/api/v1/health") {
+        const QJsonArray all = controller->outputs();
+        int streaming = 0, backups = 0, silent = 0, reconnecting = 0;
+        for (const auto &value : all) {
+            const QJsonObject item = value.toObject();
+            if (item.value("active").toBool())
+                ++streaming;
+            if (item.value("backupActive").toBool())
+                ++backups;
+            if (item.value("silenceAlert").toBool())
+                ++silent;
+            if (item.value("reconnecting").toBool())
+                ++reconnecting;
+        }
+        reply(socket, 200, QJsonObject{{"configuredOutputs", all.size()},
+                                        {"streamingOutputs", streaming},
+                                        {"backupOutputs", backups},
+                                        {"silentOutputs", silent},
+                                        {"reconnectingOutputs", reconnecting},
+                                        {"audioBuses", 16}});
+        return;
+    }
     if (method == "GET" && path == "/api/v1/scenes") {
         reply(socket, 200, QJsonObject{{"scenes", controller->scenes()}});
         return;
