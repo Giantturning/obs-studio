@@ -70,8 +70,8 @@ MatrixDock::MatrixDock(QWidget *parent) : QDockWidget("Matrix Control", parent),
     layout->addWidget(routesTable);
 
     layout->addWidget(new QLabel("Independent RTMP(S) destinations with scene, audio bus, group and backup:", root));
-    outputsTable->setColumnCount(11);
-    outputsTable->setHorizontalHeaderLabels({"Name", "RTMP(S) URL", "Stream key", "Audio bus", "Scene", "Group",
+    outputsTable->setColumnCount(12);
+    outputsTable->setHorizontalHeaderLabels({"Name", "RTMP(S) URL", "Stream key", "Audio bus", "Encoder", "Scene", "Group",
                                            "Backup URL", "Backup key", "Failover", "State", "Control"});
     outputsTable->horizontalHeader()->setSectionResizeMode(QHeaderView::ResizeToContents);
     outputsTable->horizontalHeader()->setSectionResizeMode(1, QHeaderView::Stretch);
@@ -219,6 +219,12 @@ void MatrixDock::populateOutputs()
         auto *track = new QSpinBox(outputsTable);
         track->setRange(1, 16);
         track->setValue(output.value("audioMix").toInt());
+        auto *encoder = new QComboBox(outputsTable);
+        for (const auto &value : controller->videoEncoders()) {
+            const QString encoderId = value.toObject().value("id").toString();
+            encoder->addItem(encoderId, encoderId);
+        }
+        encoder->setCurrentIndex(qMax(0, encoder->findData(output.value("videoEncoderId").toString())));
         auto *scene = new QComboBox(outputsTable);
         scene->addItem("Program", "");
         for (const auto &value : controller->scenes()) {
@@ -247,13 +253,14 @@ void MatrixDock::populateOutputs()
         outputsTable->setCellWidget(row, 1, url);
         outputsTable->setCellWidget(row, 2, key);
         outputsTable->setCellWidget(row, 3, track);
-        outputsTable->setCellWidget(row, 4, scene);
-        outputsTable->setCellWidget(row, 5, group);
-        outputsTable->setCellWidget(row, 6, backupUrl);
-        outputsTable->setCellWidget(row, 7, backupKey);
-        outputsTable->setCellWidget(row, 8, failover);
-        outputsTable->setCellWidget(row, 9, state);
-        outputsTable->setCellWidget(row, 10, control);
+        outputsTable->setCellWidget(row, 4, encoder);
+        outputsTable->setCellWidget(row, 5, scene);
+        outputsTable->setCellWidget(row, 6, group);
+        outputsTable->setCellWidget(row, 7, backupUrl);
+        outputsTable->setCellWidget(row, 8, backupKey);
+        outputsTable->setCellWidget(row, 9, failover);
+        outputsTable->setCellWidget(row, 10, state);
+        outputsTable->setCellWidget(row, 11, control);
         connect(remove, &QPushButton::clicked, this, [this, id]() {
             QString error;
             if (!controller->removeOutput(id, error)) {
@@ -264,7 +271,7 @@ void MatrixDock::populateOutputs()
             refresh();
         });
 
-        connect(button, &QPushButton::clicked, this, [this, id, name, url, key, track, scene, group, backupUrl, backupKey, failover, state]() {
+        connect(button, &QPushButton::clicked, this, [this, id, name, url, key, track, encoder, scene, group, backupUrl, backupKey, failover, state]() {
             QString error;
             const QJsonArray items = controller->outputs();
             bool active = false;
@@ -278,6 +285,7 @@ void MatrixDock::populateOutputs()
                 QJsonObject changes{{"name", name->text()}, {"server", url->text()},
                                     {"audioMix", track->value()},
                                     {"videoSourceUuid", scene->currentData().toString()},
+                                    {"videoEncoderId", encoder->currentData().toString()},
                                     {"group", group->text()}, {"backupServer", backupUrl->text()},
                                     {"failoverEnabled", failover->isChecked()}};
                 if (!backupKey->text().isEmpty())
@@ -328,8 +336,8 @@ void MatrixDock::refresh()
     const QJsonArray outputs = controller->outputs();
     for (int row = 0; row < outputs.size(); ++row) {
         const QJsonObject output = outputs[row].toObject();
-        auto *state = qobject_cast<QLabel *>(outputsTable->cellWidget(row, 9));
-        auto *control = outputsTable->cellWidget(row, 10);
+        auto *state = qobject_cast<QLabel *>(outputsTable->cellWidget(row, 10));
+        auto *control = outputsTable->cellWidget(row, 11);
         auto *button = control ? control->findChild<QPushButton *>() : nullptr;
         if (!state || !button)
             continue;
@@ -541,13 +549,15 @@ async function groupAction(action){try{
 async function editOutput(id){
   if(!lastStatus)return;
   const o=(lastStatus.matrixOutputs||[]).find(x=>x.id===id);if(!o)return;
+  const encoder=prompt('H.264 encoder ID (see /api/v1/encoders)',o.videoEncoderId||'obs_x264');
+  if(encoder===null)return;
   const scene=prompt('Video scene UUID (empty = main program)',o.videoSourceUuid||'');
   if(scene===null)return;
   const bus=prompt('Audio bus (1–16)',String(o.audioMix));
   if(bus===null)return;
   const server=prompt('RTMP server URL',o.server||'');if(server===null)return;
   const group=prompt('Output group',o.group||'default');if(group===null)return;
-  try{await api('outputs/'+id+'/config','PATCH',{videoSourceUuid:scene,audioMix:Number(bus),
+  try{await api('outputs/'+id+'/config','PATCH',{videoSourceUuid:scene,videoEncoderId:encoder,audioMix:Number(bus),
        server:server,group:group});render(await api('status'))}
   catch(e){document.getElementById('message').textContent=e.message;}
 }
@@ -700,6 +710,10 @@ void MatrixDock::dispatch(QTcpSocket *socket, const QByteArray &method, const QB
                                         {"silentOutputs", silent},
                                         {"reconnectingOutputs", reconnecting},
                                         {"audioBuses", 16}});
+        return;
+    }
+    if (method == "GET" && path == "/api/v1/encoders") {
+        reply(socket, 200, QJsonObject{{"encoders", controller->videoEncoders()}});
         return;
     }
     if (method == "GET" && path == "/api/v1/scenes") {
