@@ -44,11 +44,47 @@ function Package {
 
     Install-BuildDependencies -WingetFile "${ScriptHome}/.Wingetfile"
 
-    $GitDescription = Invoke-External git describe --tags --long
-    $Tokens = ($GitDescription -split '-')
-    $CommitVersion = $Tokens[0..$($Tokens.Count - 3)] -join '-'
-    $CommitHash = $($Tokens[-1]).SubString(1)
-    $CommitDistance = $Tokens[-2]
+    # An OBS fork might not have a semantic-version tag yet.
+    # --always keeps git describe successful even with no tags.
+    $GitDescription = Invoke-External git describe --tags --long --always
+    if ( $GitDescription -match '^(.+)-([0-9]+)-g([0-9a-fA-F]+)
+
+    if ( $CommitDistance -gt 0 ) {
+        $OutputName = "obs-studio-${CommitVersion}-${CommitHash}"
+    } else {
+        $OutputName = "obs-studio-${CommitVersion}"
+    }
+
+    $CpackArgs = @(
+        '-C', "${Configuration}"
+    )
+
+    if ( $DebugPreference -eq 'Continue' ) {
+        $CpackArgs += ('--verbose')
+    }
+
+    Log-Group "Packaging obs-studio..."
+
+    Push-Location -Stack PackageTemp "build_${Target}"
+
+    cpack @CpackArgs
+
+    $Package = Get-ChildItem -filter "obs-studio-*-windows-${Target}.zip" -File
+    Move-Item -Path $Package -Destination "${OutputName}-windows-${Target}.zip"
+
+    Pop-Location -Stack PackageTemp
+}
+
+Package
+ ) {
+        $CommitVersion = $Matches[1]
+        $CommitDistance = [int]$Matches[2]
+        $CommitHash = $Matches[3]
+    } else {
+        $CommitVersion = '0.0.1'
+        $CommitDistance = 1
+        $CommitHash = (Invoke-External git rev-parse --short HEAD).Trim()
+    }
 
     if ( $CommitDistance -gt 0 ) {
         $OutputName = "obs-studio-${CommitVersion}-${CommitHash}"
