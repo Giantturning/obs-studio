@@ -499,7 +499,8 @@ table{border-collapse:collapse;width:100%;min-width:860px}td,th{text-align:left;
 .small{font-size:12px;color:#a9b7ca}.live{color:#75e2ae}.off{color:#e9a7a7}
 #token{width:310px}.warn{color:#ffcd85}#message{white-space:pre-wrap}
 </style></head><body><header><div><h1>OBS Matrix Studio</h1>
-<div class="small">Local Windows control dashboard – 16 buses, 8+ outputs</div></div>
+<div class="small">Local Windows control dashboard – 16 buses, 8+ outputs</div>
+<div id="systemStats" class="small"></div></div>
 <div><input id="token" type="password" placeholder="Paste local API token">
 <button onclick="connect()">Connect</button></div></header>
 <p id="message" class="warn">Enter apiToken from OBSMatrixStudio.ini to connect.</p>
@@ -525,6 +526,10 @@ async function api(path,method='GET',body=undefined){
 }
 function render(data){
   lastStatus=data;
+  document.getElementById('systemStats').textContent=
+    'OBS CPU: '+Math.round(data.cpuPercent||0)+'% | Memory: '+
+    Math.round(data.processMemoryMb||0)+' MB | Active destinations: '+
+    (data.matrixOutputs||[]).filter(o=>o.active).length;
   document.getElementById('outputs').innerHTML=(data.matrixOutputs||[]).map(o=>
     '<tr><td>'+enc(o.name)+'</td><td>'+enc(o.videoSourceUuid||'Program')+
     '</td><td>'+o.audioMix+'</td><td>'+enc(o.group)+'</td><td>'+
@@ -720,12 +725,15 @@ void MatrixDock::dispatch(QTcpSocket *socket, const QByteArray &method, const QB
             if (item.value("reconnecting").toBool())
                 ++reconnecting;
         }
+        const QJsonObject stats = controller->status();
         reply(socket, 200, QJsonObject{{"configuredOutputs", all.size()},
                                         {"streamingOutputs", streaming},
                                         {"backupOutputs", backups},
                                         {"silentOutputs", silent},
                                         {"reconnectingOutputs", reconnecting},
-                                        {"audioBuses", 16}});
+                                        {"audioBuses", 16},
+                                        {"cpuPercent", stats.value("cpuPercent")},
+                                        {"processMemoryMb", stats.value("processMemoryMb")}});
         return;
     }
     if (method == "GET" && path == "/api/v1/encoders") {
