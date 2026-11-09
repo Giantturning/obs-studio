@@ -541,6 +541,37 @@ bool MatrixController::start(const QString &id, QString &error)
     return false;
 }
 
+bool MatrixController::switchScene(const QString &id, const QString &sceneUuid, QString &error)
+{
+    Destination *d = find(id);
+    if (!d) {
+        error = "Unknown output";
+        return false;
+    }
+    if (!d->output || !obs_output_active(d->output))
+        return configure(id, QJsonObject{{"videoSourceUuid", sceneUuid}}, error);
+    if (!d->view) {
+        error = "Program output cannot switch video views live; stop and configure a scene first";
+        return false;
+    }
+    if (sceneUuid.isEmpty()) {
+        error = "A live independent video view requires a scene UUID";
+        return false;
+    }
+    obs_source_t *scene = obs_get_source_by_uuid(sceneUuid.toUtf8().constData());
+    if (!scene || !obs_scene_from_source(scene)) {
+        if (scene)
+            obs_source_release(scene);
+        error = "Scene not found";
+        return false;
+    }
+    obs_view_set_source(d->view, 0, scene);
+    obs_source_release(scene);
+    d->videoSourceUuid = sceneUuid;
+    save();
+    return true;
+}
+
 bool MatrixController::stop(const QString &id, QString &error)
 {
     Destination *d = find(id);
