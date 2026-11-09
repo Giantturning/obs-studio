@@ -6,6 +6,8 @@
 #include <QJsonObject>
 #include <QString>
 
+#include <array>
+#include <atomic>
 #include <memory>
 #include <vector>
 
@@ -19,6 +21,7 @@ public:
     QJsonArray outputs() const;
     QJsonArray sources() const;
     QJsonArray scenes() const;
+    QJsonArray audioMeters() const;
     QJsonArray groups() const;
     QJsonArray presets() const;
     QJsonObject status() const;
@@ -63,6 +66,13 @@ private:
     };
 
     static constexpr size_t maxOutputs = 64;
+    struct BusMeter {
+        std::atomic<float> peakDb{-96.0f};
+        std::atomic<qint64> lastSignalMs{0};
+        bool connected = false;
+    };
+    std::array<BusMeter, 16> busMeters{};
+    static void onAudioSamples(void *param, size_t mix, struct audio_data *data);
     std::vector<std::unique_ptr<Destination>> destinations;
     quint64 nextOutputId = 9;
     Destination *find(const QString &id);
