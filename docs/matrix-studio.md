@@ -6,13 +6,14 @@ Native OBS Studio fork (not a plugin), based on libobs and the Qt frontend.
 
 - 8 RTMP(S) outputs by default; create/delete destinations dynamically (up to 64 configurations).
 - 16 native OBS audio buses instead of the stock 6. The source routing matrix supports 16-bit routing masks (0–65535).
-- Per-output Program video or separate OBS scene via OBS view rendering. Each output may use its own selected H.264 encoder, bitrate, audio bus, RTMP URL/key and backup server.
+- Per-output Program video or separate OBS scene via OBS view rendering, with live scene switching for outputs using independent scene views. Each output may use its own selected H.264 encoder, bitrate, audio bus, RTMP URL/key and backup server.
 - Dynamic video encoder discovery: choose a listed H.264 encoder, including hardware encoders (NVENC, QSV or AMF) if OBS exposes them at runtime. Hardware combinations are not yet tested.
 - Encoder sharing for matching Program-only outputs and matching bitrate/encoder ID (experimental).
 - Backup RTMP URL/key and one automatic backup attempt after a primary failure or when native reconnect has stopped. No seamless switch or automatic failback yet.
 - Named output groups with start/stop.
 - Named presets for destination and source mixer routing. For safety, stream keys are not duplicated into presets.
 - Per-output outgoing bitrate, reconnect status, frame drops, connection time, and live/backup state.
+- OBS process CPU percent and resident memory metrics in the status API and dashboard.
 - 16 native audio peak meters and silence alarms for active outputs (threshold -55 dB, more than 10 seconds).
 - Browser dashboard: http://127.0.0.1:4456/dashboard
 - Local REST API on 127.0.0.1:4456 and read-only WebSocket event stream on 127.0.0.1:4457/events.
@@ -30,6 +31,16 @@ For POST/PATCH/PUT sends use JSON.
 | --- | --- | --- |
 | GET | /api/v1/status | All outputs, audio routing, meter levels, scenes, encoder choices |
 | GET | /api/v1/health | Counts of streaming, backup, reconnecting, silent outputs |
+| GET | /api/v1/program | OBS native stream, recording, studio-mode and program-scene status |
+| POST | /api/v1/program/stream/start | Start native OBS program streaming |
+| POST | /api/v1/program/stream/stop | Stop native OBS program streaming |
+| POST | /api/v1/program/record/start | Start native OBS recording |
+| POST | /api/v1/program/record/stop | Stop native OBS recording |
+| POST | /api/v1/program/studio/enable | Enable studio mode |
+| POST | /api/v1/program/studio/disable | Disable studio mode |
+| POST | /api/v1/program/scene | Select main OBS scene; JSON uuid |
+| PATCH | /api/v1/audio/{source-uuid} | Set source muted and/or volume (0.0–4.0) |
+| POST | /api/v1/outputs/{id}/scene | Hot switch scene on a scene-routed output; JSON videoSourceUuid |
 | GET | /api/v1/outputs | Current destinations; secret keys omitted |
 | POST | /api/v1/outputs | Create an RTMP destination |
 | DELETE | /api/v1/outputs/{id} | Remove a stopped destination |
