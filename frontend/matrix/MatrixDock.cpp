@@ -5,6 +5,7 @@
 #include <QAbstractItemView>
 #include <QCheckBox>
 #include <QComboBox>
+#include <QCryptographicHash>
 #include <QInputDialog>
 #include <QFormLayout>
 #include <QHeaderView>
@@ -42,7 +43,8 @@ QString generateToken()
 
 MatrixDock::MatrixDock(QWidget *parent) : QDockWidget("Matrix Control", parent),
     controller(new MatrixController(this)), routesTable(new QTableWidget(this)),
-    outputsTable(new QTableWidget(this)), server(new QTcpServer(this)), refreshTimer(new QTimer(this))
+    outputsTable(new QTableWidget(this)), server(new QTcpServer(this)),
+    websocketServer(new QTcpServer(this)), refreshTimer(new QTimer(this))
 {
     setObjectName("matrixControlDock");
     auto *root = new QWidget(this);
@@ -148,6 +150,13 @@ MatrixDock::MatrixDock(QWidget *parent) : QDockWidget("Matrix Control", parent),
         apiLabel->setText("API unavailable: " + server->errorString());
     }
 
+    if (websocketServer->listen(QHostAddress::LocalHost, 4457))
+        connect(websocketServer, &QTcpServer::newConnection, this, &MatrixDock::acceptWebSocket);
+    auto *dashboardLink = new QLabel(
+        "<a href='http://127.0.0.1:4456/dashboard'>Open browser dashboard</a>", root);
+    dashboardLink->setOpenExternalLinks(true);
+    layout->addWidget(dashboardLink);
+
     setWidget(root);
     populateOutputs();
     refreshTimer->setInterval(1000);
@@ -160,6 +169,10 @@ MatrixDock::~MatrixDock()
 {
     refreshTimer->stop();
     server->close();
+    websocketServer->close();
+    for (QTcpSocket *socket : websocketClients)
+        socket->abort();
+    websocketClients.clear();
     for (QTcpSocket *socket : pending.keys())
         socket->abort();
 }
@@ -306,6 +319,7 @@ void MatrixDock::refresh()
         button->setText(active ? "Stop" : "Start");
     }
     refreshing = false;
+    broadcastStatus();
 }
 
 void MatrixDock::updateRoute(int row, int track, bool selected)
@@ -375,6 +389,10 @@ void MatrixDock::processRequest(QTcpSocket *socket)
     }
     if (buffer.size() < separator + 4 + contentLength)
         return;
+    if (firstLine[0] == "GET" && firstLine[1] == "/dashboard") {
+        replyHtml(socket);
+        return;
+    }
     if (!authenticated) {
         reply(socket, 401, QJsonObject{{"error", "Authorization required"}});
         return;
@@ -405,9 +423,224 @@ void MatrixDock::reply(QTcpSocket *socket, int code, const QJsonObject &data)
     socket->disconnectFromHost();
 }
 
+
+void MatrixDock::replyHtml(QTcpSocket *socket)
+{
+    // This page contains no bearer token. Only authenticated requests access OBS state.
+    const QByteArray page = R"MATRIXHTML(<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><title>OBS Matrix Studio</title>
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<style>
+body{background:#131721;color:#f2f4f8;font:15px system-ui,sans-serif;margin:25px}
+header{display:flex;justify-content:space-between;flex-wrap:wrap;align-items:center}
+h1{margin:0 0 12px}input,button{background:#252c39;color:inherit;border:1px solid #4c5870;
+border-radius:7px;padding:8px}button{cursor:pointer;margin:2px}button:hover{background:#3a495c}
+.panel{background:#1d2532;padding:16px;margin:15px 0;border-radius:12px;overflow-x:auto}
+table{border-collapse:collapse;width:100%;min-width:860px}td,th{text-align:left;padding:8px;border-bottom:1px solid #364152}
+.small{font-size:12px;color:#a9b7ca}.live{color:#75e2ae}.off{color:#e9a7a7}
+#token{width:310px}.warn{color:#ffcd85}#message{white-space:pre-wrap}
+</style></head><body><header><div><h1>OBS Matrix Studio</h1>
+<div class="small">Local Windows control dashboard – 16 buses, 8+ outputs</div></div>
+<div><input id="token" type="password" placeholder="Paste local API token">
+<button onclick="connect()">Connect</button></div></header>
+<p id="message" class="warn">Enter apiToken from OBSMatrixStudio.ini to connect.</p>
+<section class="panel"><h2>RTMP outputs</h2><table><thead><tr><th>Name</th>
+<th>Video scene UUID</th><th>Bus</th><th>Group</th><th>Bitrate</th>
+<th>Dropped</th><th>State</th><th>Controls</th></tr></thead>
+<tbody id="outputs"></tbody></table></section>
+<section class="panel"><h2>Group controls</h2><input id="group" value="default">
+<button onclick="groupAction('start')">Start group</button>
+<button onclick="groupAction('stop')">Stop group</button>
+<button onclick="makeOutput()">Add output</button></section>
+<section class="panel"><h2>Audio source routing</h2><div id="sources"></div></section>
+<script>
+let secret='',websocket=null;
+function enc(v){return String(v).replace(/[&<>"']/g,x=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[x]));}
+async function api(path,method='GET',body=undefined){
+  if(!secret) throw Error('Enter API token first');
+  const r=await fetch('/api/v1/'+path,{method,
+    headers:{Authorization:'Bearer '+secret,'Content-Type':'application/json'},
+    body:body===undefined?undefined:JSON.stringify(body)});
+  const data=await r.json();if(!r.ok)throw Error(data.error||'HTTP '+r.status);return data;
+}
+function render(data){
+  document.getElementById('outputs').innerHTML=(data.matrixOutputs||[]).map(o=>
+    '<tr><td>'+enc(o.name)+'</td><td>'+enc(o.videoSourceUuid||'Program')+
+    '</td><td>'+o.audioMix+'</td><td>'+enc(o.group)+'</td><td>'+
+    Math.round(o.bitrateKbps||0)+' kbps</td><td>'+o.droppedFrames+'</td><td class="'+
+    (o.active?'live':'off')+'">'+(o.backupActive?'BACKUP ': '')+
+    (o.active?'LIVE':o.reconnecting?'Reconnecting':'Stopped')+
+    '</td><td><button onclick="outputAction('+JSON.stringify(o.id)+','+
+    JSON.stringify(o.active?'stop':'start')+')">'+(o.active?'Stop':'Start')+
+    '</button></td></tr>').join('');
+  document.getElementById('sources').textContent=(data.audioSources||[])
+    .map(s=>s.name+' (UUID '+s.uuid+'): 0x'+s.mixers.toString(16)).join(' | ');
+}
+async function connect(){
+  secret=document.getElementById('token').value.trim();
+  try{render(await api('status'));document.getElementById('message').textContent='Connected';
+    if(websocket)websocket.close();
+    websocket=new WebSocket('ws://127.0.0.1:4457/events','matrix.'+secret);
+    websocket.onmessage=evt=>{try{render(JSON.parse(evt.data))}catch(e){}};
+    websocket.onclose=()=>{document.getElementById('message').textContent='WebSocket disconnected. REST refresh still available.'};
+  }catch(e){document.getElementById('message').textContent=e.message;}
+}
+async function outputAction(id,action){try{await api('outputs/'+id+'/'+action,'POST');render(await api('status'))}
+catch(e){document.getElementById('message').textContent=e.message;}}
+async function groupAction(action){try{
+ const group=document.getElementById('group').value;
+ const data=await api('groups/'+encodeURIComponent(group)+'/'+action,'POST');
+ document.getElementById('message').textContent=JSON.stringify(data);render(await api('status'));
+}catch(e){document.getElementById('message').textContent=e.message;}}
+async function makeOutput(){try{const d=await api('outputs','POST');document.getElementById('message').textContent='Created '+d.id;render(await api('status'))}
+catch(e){document.getElementById('message').textContent=e.message;}}
+</script></body></html>)MATRIXHTML";
+    const QByteArray response = "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\n"
+                                "Cache-Control: no-store\r\nX-Content-Type-Options: nosniff\r\n"
+                                "Connection: close\r\nContent-Length: " +
+                                QByteArray::number(page.size()) + "\r\n\r\n" + page;
+    socket->write(response);
+    socket->disconnectFromHost();
+}
+
+void MatrixDock::acceptWebSocket()
+{
+    while (websocketServer->hasPendingConnections()) {
+        QTcpSocket *socket = websocketServer->nextPendingConnection();
+        auto *buffer = new QByteArray;
+        connect(socket, &QTcpSocket::disconnected, this, [this, socket, buffer]() {
+            websocketClients.remove(socket);
+            delete buffer;
+            socket->deleteLater();
+        });
+        connect(socket, &QTcpSocket::readyRead, this, [this, socket, buffer]() {
+            if (websocketClients.contains(socket)) {
+                socket->readAll(); // Read-only event protocol, no client commands.
+                return;
+            }
+            *buffer += socket->readAll();
+            if (buffer->size() > 8192) {
+                socket->disconnectFromHost();
+                return;
+            }
+            if (!buffer->contains("\r\n\r\n"))
+                return;
+            const QList<QByteArray> lines = buffer->split('\n');
+            bool authorized = false;
+            QByteArray key;
+            const QByteArray expected = "matrix." + apiToken.toUtf8();
+            if (lines.isEmpty() || !lines[0].startsWith("GET /events ")) {
+                socket->disconnectFromHost();
+                return;
+            }
+            for (const auto &raw : lines) {
+                const QByteArray line = raw.trimmed();
+                const int colon = line.indexOf(':');
+                if (colon < 0)
+                    continue;
+                const QByteArray header = line.left(colon).trimmed().toLower();
+                const QByteArray value = line.mid(colon + 1).trimmed();
+                if (header == "sec-websocket-key")
+                    key = value;
+                else if (header == "sec-websocket-protocol")
+                    authorized = value.split(',').contains(expected);
+            }
+            if (!authorized || QByteArray::fromBase64(key).size() != 16) {
+                socket->write("HTTP/1.1 401 Unauthorized\r\nConnection: close\r\n\r\n");
+                socket->disconnectFromHost();
+                return;
+            }
+            const QByteArray accept = QCryptographicHash::hash(
+                key + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11",
+                QCryptographicHash::Sha1).toBase64();
+            socket->write("HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\n"
+                          "Connection: Upgrade\r\nSec-WebSocket-Accept: " + accept +
+                          "\r\nSec-WebSocket-Protocol: " + expected + "\r\n\r\n");
+            websocketClients.insert(socket);
+            broadcastStatus();
+        });
+    }
+}
+
+void MatrixDock::broadcastStatus()
+{
+    if (websocketClients.isEmpty())
+        return;
+    const QByteArray body = QJsonDocument(controller->status()).toJson(QJsonDocument::Compact);
+    QByteArray frame;
+    frame.append(char(0x81));
+    if (body.size() < 126) {
+        frame.append(char(body.size()));
+    } else if (body.size() <= 65535) {
+        frame.append(char(126));
+        frame.append(char((body.size() >> 8) & 0xff));
+        frame.append(char(body.size() & 0xff));
+    } else {
+        frame.append(char(127));
+        const quint64 size = quint64(body.size());
+        for (int i = 7; i >= 0; --i)
+            frame.append(char((size >> (8 * i)) & 0xff));
+    }
+    frame.append(body);
+    for (QTcpSocket *socket : websocketClients) {
+        if (socket->state() != QAbstractSocket::ConnectedState || socket->bytesToWrite() > 1048576) {
+            socket->abort();
+            continue;
+        }
+        socket->write(frame);
+    }
+}
+
 void MatrixDock::dispatch(QTcpSocket *socket, const QByteArray &method, const QByteArray &path,
                           const QJsonObject &payload)
 {
+    if (method == "GET" && path == "/api/v1/scenes") {
+        reply(socket, 200, QJsonObject{{"scenes", controller->scenes()}});
+        return;
+    }
+    if (method == "GET" && path == "/api/v1/groups") {
+        reply(socket, 200, QJsonObject{{"groups", controller->groups()}});
+        return;
+    }
+    if (method == "GET" && path == "/api/v1/presets") {
+        reply(socket, 200, QJsonObject{{"presets", controller->presets()}});
+        return;
+    }
+    if (method == "POST" && path == "/api/v1/presets/save") {
+        QString error;
+        const bool ok = controller->savePreset(payload.value("name").toString(), error);
+        reply(socket, ok ? 200 : 400, ok ? QJsonObject{{"ok", true}} : QJsonObject{{"error", error}});
+        return;
+    }
+    if (method == "POST" && path == "/api/v1/presets/load") {
+        QString error;
+        const bool ok = controller->loadPreset(payload.value("name").toString(), error);
+        reply(socket, ok ? 200 : 400, ok ? QJsonObject{{"ok", true}} : QJsonObject{{"error", error}});
+        if (ok)
+            populateOutputs();
+        refresh();
+        return;
+    }
+    if (method == "DELETE" && path.startsWith("/api/v1/presets/")) {
+        QString error;
+        const bool ok = controller->deletePreset(QString::fromUtf8(path.mid(sizeof("/api/v1/presets/") - 1)), error);
+        reply(socket, ok ? 200 : 400, ok ? QJsonObject{{"ok", true}} : QJsonObject{{"error", error}});
+        return;
+    }
+    const QList<QByteArray> groupParts = path.split('/');
+    if (method == "POST" && groupParts.size() == 6 &&
+        groupParts[1] == "api" && groupParts[2] == "v1" &&
+        groupParts[3] == "groups") {
+        const QString group = QString::fromUtf8(QByteArray::fromPercentEncoding(groupParts[4]));
+        if (groupParts[5] == "start")
+            reply(socket, 200, controller->startGroup(group));
+        else if (groupParts[5] == "stop")
+            reply(socket, 200, controller->stopGroup(group));
+        else
+            reply(socket, 404, QJsonObject{{"error", "Unknown group action"}});
+        refresh();
+        return;
+    }
     if (method == "GET" && path == "/api/v1/status") {
         reply(socket, 200, controller->status());
         return;
