@@ -7,6 +7,10 @@
 #include <QJsonArray>
 #include <QSettings>
 
+#include <algorithm>
+#include <memory>
+#include <utility>
+
 namespace {
 struct SourceList {
     QJsonArray sources;
@@ -36,23 +40,47 @@ bool isAllowedServer(const QString &server)
 MatrixController::MatrixController(QObject *parent) : QObject(parent)
 {
     QSettings settings(QSettings::IniFormat, QSettings::UserScope, "Giantturning", "OBSMatrixStudio");
-    for (size_t i = 0; i < destinations.size(); ++i) {
-        auto &d = destinations[i];
-        d.id = QString("rtmp-%1").arg(i + 1, 2, 10, QLatin1Char('0'));
-        settings.beginGroup(d.id);
-        d.name = settings.value("name", QString("Output %1").arg(i + 1)).toString();
-        d.server = settings.value("server").toString();
-        d.key = settings.value("key").toString();
-        d.audioMix = qBound(0, settings.value("audioMix", int(i < 4 ? i : 0)).toInt(), 5);
-        d.videoBitrate = qBound(500, settings.value("videoBitrate", 3500).toInt(), 50000);
-        d.audioBitrate = qBound(64, settings.value("audioBitrate", 160).toInt(), 320);
-        settings.endGroup();
+    nextOutputId = qMax(quint64(9), settings.value("nextOutputId", 9).toULongLong());
+
+    // Keep previously saved outputs; initialize eight destinations on a new install.
+    QStringList ids = settings.childGroups();
+    for (int i = 1; i <= 8; ++i) {
+        const QString id = QString("rtmp-%1").arg(i, 2, 10, QLatin1Char('0'));
+        if (!ids.contains(id))
+            ids.append(id);
     }
+    ids.removeDuplicates();
+    std::sort(ids.begin(), ids.end(), [](const QString &a, const QString &b) {
+        return a.mid(5).toInt() < b.mid(5).toInt();
+    });
+
+    for (const QString &id : ids) {
+        if (!id.startsWith("rtmp-") || destinations.size() >= maxOutputs)
+            continue;
+        bool ok = false;
+        const unsigned long long numericId = id.mid(5).toULongLong(&ok);
+        if (!ok || numericId < 1)
+            continue;
+        nextOutputId = qMax(nextOutputId, quint64(numericId + 1));
+        auto d = std::make_unique<Destination>();
+        d->id = id;
+        settings.beginGroup(id);
+        d->name = settings.value("name", QString("Output %1").arg(numericId)).toString();
+        d->server = settings.value("server").toString();
+        d->key = settings.value("key").toString();
+        d->audioMix = qBound(0, settings.value("audioMix", int((numericId - 1) % 6)).toInt(), 5);
+        d->videoBitrate = qBound(500, settings.value("videoBitrate", 3500).toInt(), 50000);
+        d->audioBitrate = qBound(64, settings.value("audioBitrate", 160).toInt(), 320);
+        settings.endGroup();
+        destinations.push_back(std::move(d));
+    }
+    save();
 }
 
 MatrixController::~MatrixController()
 {
-    for (auto &d : destinations) {
+    for (auto &destination : destinations) {
+        Destination &d = *destination;
         if (d.output && obs_output_active(d.output))
             obs_output_stop(d.output);
         release(d);
@@ -61,18 +89,54 @@ MatrixController::~MatrixController()
 
 MatrixController::Destination *MatrixController::find(const QString &id)
 {
-    for (auto &d : destinations)
-        if (d.id == id)
-            return &d;
+    for (const auto &destination : destinations)
+        if (destination->id == id)
+            return destination.get();
     return nullptr;
 }
 
 const MatrixController::Destination *MatrixController::find(const QString &id) const
 {
-    for (const auto &d : destinations)
-        if (d.id == id)
-            return &d;
+    for (const auto &destination : destinations)
+        if (destination->id == id)
+            return destination.get();
     return nullptr;
+}
+
+bool MatrixController::addOutput(QString &id, QString &error)
+{
+    if (destinations.size() >= maxOutputs) {
+        error = "Maximum of 64 outputs reached";
+        return false;
+    }
+    auto d = std::make_unique<Destination>();
+    d->id = QString("rtmp-%1").arg(nextOutputId++, 2, 10, QLatin1Char('0'));
+    d->name = QString("Output %1").arg(destinations.size() + 1);
+    d->audioMix = int(destinations.size() % 6);
+    id = d->id;
+    destinations.push_back(std::move(d));
+    save();
+    return true;
+}
+
+bool MatrixController::removeOutput(const QString &id, QString &error)
+{
+    const auto it = std::find_if(destinations.begin(), destinations.end(),
+                                 [&id](const auto &d) { return d->id == id; });
+    if (it == destinations.end()) {
+        error = "Unknown output";
+        return false;
+    }
+    if ((*it)->output && obs_output_active((*it)->output)) {
+        error = "Stop the output before removing it";
+        return false;
+    }
+    release(**it);
+    destinations.erase(it);
+    QSettings settings(QSettings::IniFormat, QSettings::UserScope, "Giantturning", "OBSMatrixStudio");
+    settings.remove(id);
+    save();
+    return true;
 }
 
 void MatrixController::release(Destination &d)
@@ -101,7 +165,9 @@ void MatrixController::save() const
     // The per-user OBSMatrixStudio.ini file contains stream keys.
     // Do not share this file; API responses never include the keys.
     QSettings settings(QSettings::IniFormat, QSettings::UserScope, "Giantturning", "OBSMatrixStudio");
-    for (const auto &d : destinations) {
+    settings.setValue("nextOutputId", qulonglong(nextOutputId));
+    for (const auto &destination : destinations) {
+        const Destination &d = *destination;
         settings.beginGroup(d.id);
         settings.setValue("name", d.name);
         settings.setValue("server", d.server);
@@ -117,7 +183,8 @@ void MatrixController::save() const
 QJsonArray MatrixController::outputs() const
 {
     QJsonArray result;
-    for (const auto &d : destinations) {
+    for (const auto &destination : destinations) {
+        const Destination &d = *destination;
         QJsonObject item;
         item["id"] = d.id;
         item["name"] = d.name;
