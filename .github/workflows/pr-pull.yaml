@@ -20,6 +20,9 @@ jobs:
       contents: read
 
   build-project:
+    # Keep upstream's multi-platform CI only on the upstream OBS project.
+    # This fork uses the Windows-only matrix-studio-ci.yaml instead.
+    if: github.repository_owner == 'obsproject'
     name: Build 🧱
     uses: ./.github/workflows/build-project.yaml
     secrets: inherit
