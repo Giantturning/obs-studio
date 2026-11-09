@@ -10,6 +10,8 @@
 #include <QSettings>
 
 #include <algorithm>
+#include <chrono>
+#include <cmath>
 #include <memory>
 #include <utility>
 
@@ -84,11 +86,25 @@ MatrixController::MatrixController(QObject *parent) : QObject(parent)
         settings.endGroup();
         destinations.push_back(std::move(d));
     }
+    for (size_t i = 0; i < busMeters.size(); ++i) {
+        BusMeter &meter = busMeters[i];
+        meter.lastSignalMs.store(std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count());
+        struct audio_convert_info conversion = {};
+        conversion.format = AUDIO_FORMAT_FLOAT_PLANAR;
+        conversion.speakers = SPEAKERS_STEREO;
+        meter.connected = audio_output_connect(obs_get_audio(), i, &conversion,
+                                               onAudioSamples, &meter);
+    }
     save();
 }
 
 MatrixController::~MatrixController()
 {
+    for (size_t i = 0; i < busMeters.size(); ++i) {
+        if (busMeters[i].connected)
+            audio_output_disconnect(obs_get_audio(), i, onAudioSamples, &busMeters[i]);
+    }
     for (auto &destination : destinations) {
         Destination &d = *destination;
         if (d.output && obs_output_active(d.output))
@@ -200,6 +216,45 @@ void MatrixController::save() const
     settings.sync();
 }
 
+
+void MatrixController::onAudioSamples(void *param, size_t, struct audio_data *data)
+{
+    auto *meter = static_cast<BusMeter *>(param);
+    if (!data || !data->data[0])
+        return;
+    float maximum = 0.0f;
+    const auto *left = reinterpret_cast<const float *>(data->data[0]);
+    const auto *right = reinterpret_cast<const float *>(data->data[1]);
+    for (uint32_t i = 0; i < data->frames; i += 4) {
+        maximum = std::max(maximum, std::abs(left[i]));
+        if (right)
+            maximum = std::max(maximum, std::abs(right[i]));
+    }
+    const float db = maximum > 0.00001f ? 20.0f * std::log10(maximum) : -96.0f;
+    meter->peakDb.store(std::clamp(db, -96.0f, 6.0f), std::memory_order_relaxed);
+    if (db > -55.0f) {
+        const auto milliseconds = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count();
+        meter->lastSignalMs.store(qint64(milliseconds), std::memory_order_relaxed);
+    }
+}
+
+QJsonArray MatrixController::audioMeters() const
+{
+    QJsonArray result;
+    const auto now = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();
+    for (size_t i = 0; i < busMeters.size(); ++i) {
+        const auto &meter = busMeters[i];
+        const float db = meter.peakDb.load(std::memory_order_relaxed);
+        const qint64 last = meter.lastSignalMs.load(std::memory_order_relaxed);
+        result.append(QJsonObject{{"bus", int(i + 1)}, {"peakDb", double(db)},
+                                  {"silenceSeconds", double(now - last) / 1000.0},
+                                  {"connected", meter.connected}});
+    }
+    return result;
+}
+
 QJsonArray MatrixController::outputs() const
 {
     QJsonArray result;
@@ -221,6 +276,13 @@ QJsonArray MatrixController::outputs() const
         item["backupActive"] = d.backupActive;
         item["desiredActive"] = d.desiredActive;
         item["bitrateKbps"] = d.lastKbps;
+        item["audioPeakDb"] = double(busMeters[size_t(d.audioMix)].peakDb.load(std::memory_order_relaxed));
+        const qint64 last = busMeters[size_t(d.audioMix)].lastSignalMs.load(std::memory_order_relaxed);
+        const auto now = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count();
+        item["silenceAlert"] = d.output && obs_output_active(d.output) &&
+                              (now - last > 10000);
+
         item["connectTimeMs"] = d.output && obs_output_active(d.output) ? obs_output_get_connect_time_ms(d.output) : 0;
         item["totalFrames"] = d.output ? obs_output_get_total_frames(d.output) : 0;
         item["active"] = d.output && obs_output_active(d.output);
@@ -247,7 +309,7 @@ QJsonObject MatrixController::status() const
                        {"audioSources", sources()},
                        {"videoScenes", scenes()},
                        {"groups", groups()},
-                       {"audioBusCount", 16}};
+                       {"audioBusCount", 16}, {"audioMeters", audioMeters()}};
 }
 
 bool MatrixController::configure(const QString &id, const QJsonObject &changes, QString &error)
