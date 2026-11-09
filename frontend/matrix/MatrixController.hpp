@@ -12,6 +12,7 @@
 #include <vector>
 
 #include <obs.h>
+#include <util/platform.h>
 
 class MatrixController : public QObject {
 public:
@@ -86,4 +87,6 @@ private:
     bool startAttempt(Destination &d, bool useBackup, QString &error);
     bool anyActive() const;
     qint64 lastTelemetryMs = 0;
+    os_cpu_usage_info_t *cpuInfo = nullptr;
+    double lastCpuPercent = 0.0;
 };
