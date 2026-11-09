@@ -474,9 +474,10 @@ table{border-collapse:collapse;width:100%;min-width:860px}td,th{text-align:left;
 <button onclick="groupAction('start')">Start group</button>
 <button onclick="groupAction('stop')">Stop group</button>
 <button onclick="makeOutput()">Add output</button></section>
-<section class="panel"><h2>Audio source routing</h2><div id="sources"></div></section>
+<section class="panel"><h2>16-bus audio matrix</h2><div id="meters"></div>
+<div style="overflow-x:auto"><table id="matrix"></table></div></section>
 <script>
-let secret='',websocket=null;
+let secret='',websocket=null,lastStatus=null;
 function enc(v){return String(v).replace(/[&<>"']/g,x=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[x]));}
 async function api(path,method='GET',body=undefined){
   if(!secret) throw Error('Enter API token first');
@@ -486,17 +487,27 @@ async function api(path,method='GET',body=undefined){
   const data=await r.json();if(!r.ok)throw Error(data.error||'HTTP '+r.status);return data;
 }
 function render(data){
+  lastStatus=data;
   document.getElementById('outputs').innerHTML=(data.matrixOutputs||[]).map(o=>
     '<tr><td>'+enc(o.name)+'</td><td>'+enc(o.videoSourceUuid||'Program')+
     '</td><td>'+o.audioMix+'</td><td>'+enc(o.group)+'</td><td>'+
     Math.round(o.bitrateKbps||0)+' kbps</td><td>'+o.droppedFrames+'</td><td class="'+
     (o.active?'live':'off')+'">'+(o.backupActive?'BACKUP ': '')+
-    (o.active?'LIVE':o.reconnecting?'Reconnecting':'Stopped')+
-    '</td><td><button onclick="outputAction('+JSON.stringify(o.id)+','+
-    JSON.stringify(o.active?'stop':'start')+')">'+(o.active?'Stop':'Start')+
-    '</button></td></tr>').join('');
-  document.getElementById('sources').textContent=(data.audioSources||[])
-    .map(s=>s.name+' (UUID '+s.uuid+'): 0x'+s.mixers.toString(16)).join(' | ');
+    (o.active?'LIVE':o.reconnecting?'Reconnecting':'Stopped')+(o.silenceAlert?' SILENCE!':'')+
+    '</td><td><button onclick="outputAction('+enc(JSON.stringify(o.id))+','+
+    enc(JSON.stringify(o.active?'stop':'start'))+')">'+(o.active?'Stop':'Start')+
+    '</button><button onclick="editOutput('+enc(JSON.stringify(o.id))+')">Edit</button></td></tr>').join('');
+  document.getElementById('meters').innerHTML=(data.audioMeters||[])
+    .map(m=>'<span style="display:inline-block;margin:5px;border:1px solid #58667b;padding:8px;border-radius:6px">Bus '+
+        m.bus+': '+Math.round(m.peakDb)+' dB</span>').join('');
+  const sources=data.audioSources||[];
+  document.getElementById('matrix').innerHTML=
+    '<thead><tr><th>Source</th>'+Array.from({length:16},(_,i)=>'<th>'+ (i+1) +'</th>').join('')+
+    '</tr></thead><tbody>'+sources.map(src=>
+       '<tr><td>'+enc(src.name)+'</td>'+Array.from({length:16},(_,i)=>
+          '<td><input type="checkbox" '+((src.mixers & (1<<i))?'checked ':'')+
+          'onchange="routeAudio('+enc(JSON.stringify(src.uuid))+','+i+',this.checked)"></td>').join('')+
+       '</tr>').join('')+'</tbody>';
 }
 async function connect(){
   secret=document.getElementById('token').value.trim();
@@ -514,6 +525,25 @@ async function groupAction(action){try{
  const data=await api('groups/'+encodeURIComponent(group)+'/'+action,'POST');
  document.getElementById('message').textContent=JSON.stringify(data);render(await api('status'));
 }catch(e){document.getElementById('message').textContent=e.message;}}
+async function editOutput(id){
+  if(!lastStatus)return;
+  const o=(lastStatus.matrixOutputs||[]).find(x=>x.id===id);if(!o)return;
+  const scene=prompt('Video scene UUID (empty = main program)',o.videoSourceUuid||'');
+  if(scene===null)return;
+  const bus=prompt('Audio bus (1–16)',String(o.audioMix));
+  if(bus===null)return;
+  const server=prompt('RTMP server URL',o.server||'');if(server===null)return;
+  const group=prompt('Output group',o.group||'default');if(group===null)return;
+  try{await api('outputs/'+id+'/config','PATCH',{videoSourceUuid:scene,audioMix:Number(bus),
+       server:server,group:group});render(await api('status'))}
+  catch(e){document.getElementById('message').textContent=e.message;}
+}
+async function routeAudio(uuid,bit,checked){
+  const source=(lastStatus.audioSources||[]).find(s=>s.uuid===uuid);if(!source)return;
+  const mask=checked?source.mixers|(1<<bit):source.mixers&~(1<<bit);
+  try{await api('matrix/'+encodeURIComponent(uuid),'PUT',{mixers:mask});render(await api('status'))}
+  catch(e){document.getElementById('message').textContent=e.message;}
+}
 async function makeOutput(){try{const d=await api('outputs','POST');document.getElementById('message').textContent='Created '+d.id;render(await api('status'))}
 catch(e){document.getElementById('message').textContent=e.message;}}
 </script></body></html>)MATRIXHTML";
