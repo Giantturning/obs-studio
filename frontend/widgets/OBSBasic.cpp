@@ -23,6 +23,7 @@
 #include "ColorSelect.hpp"
 #include "OBSBasicControls.hpp"
 #include "OBSBasicStats.hpp"
+#include <matrix/MatrixDock.hpp>
 #include "plugin-manager/PluginManager.hpp"
 
 #include <obs-module.h>
@@ -245,6 +246,11 @@ OBSBasic::OBSBasic(QWidget *parent) : OBSMainWindow(parent), undo_s(ui), ui(new 
 	int sideDockWidth = std::min(width() * 30 / 100, 320);
 	resizeDocks({ui->scenesDock, ui->sourcesDock}, {sideDockWidth, sideDockWidth}, Qt::Horizontal);
 	addDockWidget(Qt::BottomDockWidgetArea, controlsDock);
+
+	// Matrix routing is a built-in feature of this OBS distribution.
+	MatrixDock *matrixDock = new MatrixDock(this);
+	addDockWidget(Qt::RightDockWidgetArea, matrixDock);
+	ui->menuDocks->addAction(matrixDock->toggleViewAction());
 
 	startingDockLayout = saveState();
 
