@@ -285,8 +285,12 @@ void MatrixDock::populateOutputs()
                 QMessageBox::warning(this, "Matrix Control", error);
                 return;
             }
-            populateOutputs();
-            refresh();
+            // The clicked button belongs to the table we are rebuilding.
+            // Defer destruction until Qt finishes delivering the click signal.
+            QTimer::singleShot(0, this, [this]() {
+                populateOutputs();
+                refresh();
+            });
         });
 
         connect(button, &QPushButton::clicked, this, [this, id, name, url, key, track, encoder, scene, group, backupUrl, backupKey, failover, state]() {
