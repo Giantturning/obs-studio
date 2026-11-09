@@ -6,7 +6,8 @@
 #include <QJsonObject>
 #include <QString>
 
-#include <array>
+#include <memory>
+#include <vector>
 
 #include <obs.h>
 
@@ -18,6 +19,8 @@ public:
     QJsonArray outputs() const;
     QJsonArray sources() const;
     QJsonObject status() const;
+    bool addOutput(QString &id, QString &error);
+    bool removeOutput(const QString &id, QString &error);
     bool configure(const QString &id, const QJsonObject &changes, QString &error);
     bool start(const QString &id, QString &error);
     bool stop(const QString &id, QString &error);
@@ -39,7 +42,9 @@ private:
         QString lastError;
     };
 
-    std::array<Destination, 4> destinations;
+    static constexpr size_t maxOutputs = 64;
+    std::vector<std::unique_ptr<Destination>> destinations;
+    quint64 nextOutputId = 9;
     Destination *find(const QString &id);
     const Destination *find(const QString &id) const;
     void release(Destination &d);
