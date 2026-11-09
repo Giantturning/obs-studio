@@ -20,6 +20,8 @@ jobs:
       contents: read
 
   build-project:
+    # Windows-only fork builds are handled by matrix-studio-ci.yaml.
+    if: github.repository_owner == 'obsproject'
     name: Build 🧱
     uses: ./.github/workflows/build-project.yaml
     secrets: inherit

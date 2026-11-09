@@ -1,0 +1,908 @@
+// OBS Matrix Studio: native multi-RTMP controller (GPL-2.0-or-later).
+#include "MatrixController.hpp"
+#include "MatrixSecrets.hpp"
+
+#include <utility/audio-encoders.hpp>
+#include <obs-frontend-api.h>
+
+#include <QDateTime>
+#include <QJsonArray>
+#include <QJsonDocument>
+#include <QSettings>
+
+#include <algorithm>
+#include <chrono>
+#include <cmath>
+#include <memory>
+#include <utility>
+
+namespace {
+struct SourceList {
+    QJsonArray sources;
+};
+
+bool collectAudioSources(void *data, obs_source_t *source)
+{
+    if (!(obs_source_get_output_flags(source) & OBS_SOURCE_AUDIO))
+        return true;
+
+    auto *list = static_cast<SourceList *>(data);
+    QJsonObject item;
+    item["uuid"] = QString::fromUtf8(obs_source_get_uuid(source));
+    item["name"] = QString::fromUtf8(obs_source_get_name(source));
+    item["mixers"] = int(obs_source_get_audio_mixers(source) & 65535u);
+    item["muted"] = obs_source_muted(source);
+    item["volume"] = double(obs_source_get_volume(source));
+    list->sources.append(item);
+    return true;
+}
+
+bool isAllowedServer(const QString &server)
+{
+    return server.startsWith("rtmp://", Qt::CaseInsensitive) ||
+           server.startsWith("rtmps://", Qt::CaseInsensitive);
+}
+}
+
+MatrixController::MatrixController(QObject *parent) : QObject(parent)
+{
+    QSettings settings(QSettings::IniFormat, QSettings::UserScope, "Giantturning", "OBSMatrixStudio");
+    nextOutputId = qMax(quint64(9), settings.value("nextOutputId", 9).toULongLong());
+
+    // Keep previously saved outputs; initialize eight destinations on a new install.
+    QStringList ids = settings.childGroups();
+    if (!settings.value("outputsInitialized", false).toBool()) {
+        for (int i = 1; i <= 8; ++i) {
+            const QString id = QString("rtmp-%1").arg(i, 2, 10, QLatin1Char('0'));
+            if (!ids.contains(id))
+                ids.append(id);
+        }
+        settings.setValue("outputsInitialized", true);
+    }
+    ids.removeDuplicates();
+    std::sort(ids.begin(), ids.end(), [](const QString &a, const QString &b) {
+        return a.mid(5).toInt() < b.mid(5).toInt();
+    });
+
+    for (const QString &id : ids) {
+        if (!id.startsWith("rtmp-") || destinations.size() >= maxOutputs)
+            continue;
+        bool ok = false;
+        const unsigned long long numericId = id.mid(5).toULongLong(&ok);
+        if (!ok || numericId < 1)
+            continue;
+        nextOutputId = qMax(nextOutputId, quint64(numericId + 1));
+        auto d = std::make_unique<Destination>();
+        d->id = id;
+        settings.beginGroup(id);
+        d->name = settings.value("name", QString("Output %1").arg(numericId)).toString();
+        d->server = settings.value("server").toString();
+        d->key = MatrixSecrets::unprotect(settings.value("key").toString());
+        d->audioMix = qBound(0, settings.value("audioMix", int((numericId - 1) % 16)).toInt(), 15);
+        d->videoSourceUuid = settings.value("videoSourceUuid").toString();
+        d->group = settings.value("group", "default").toString();
+        d->backupServer = settings.value("backupServer").toString();
+        d->backupKey = MatrixSecrets::unprotect(settings.value("backupKey").toString());
+        d->failoverEnabled = settings.value("failoverEnabled", false).toBool();
+        d->videoBitrate = qBound(500, settings.value("videoBitrate", 3500).toInt(), 50000);
+        d->videoEncoderId = settings.value("videoEncoderId", "obs_x264").toString();
+        d->audioBitrate = qBound(64, settings.value("audioBitrate", 160).toInt(), 320);
+        settings.endGroup();
+        destinations.push_back(std::move(d));
+    }
+    cpuInfo = os_cpu_usage_info_start();
+    for (size_t i = 0; i < busMeters.size(); ++i) {
+        BusMeter &meter = busMeters[i];
+        meter.lastSignalMs.store(std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count());
+        struct audio_convert_info conversion = {};
+        conversion.format = AUDIO_FORMAT_FLOAT_PLANAR;
+        conversion.speakers = SPEAKERS_STEREO;
+        meter.connected = audio_output_connect(obs_get_audio(), i, &conversion,
+                                               onAudioSamples, &meter);
+    }
+    save();
+}
+
+MatrixController::~MatrixController()
+{
+    for (size_t i = 0; i < busMeters.size(); ++i) {
+        if (busMeters[i].connected)
+            audio_output_disconnect(obs_get_audio(), i, onAudioSamples, &busMeters[i]);
+    }
+    if (cpuInfo) {
+        os_cpu_usage_info_destroy(cpuInfo);
+        cpuInfo = nullptr;
+    }
+    for (auto &destination : destinations) {
+        Destination &d = *destination;
+        if (d.output && obs_output_active(d.output))
+            obs_output_stop(d.output);
+        release(d);
+    }
+}
+
+MatrixController::Destination *MatrixController::find(const QString &id)
+{
+    for (const auto &destination : destinations)
+        if (destination->id == id)
+            return destination.get();
+    return nullptr;
+}
+
+const MatrixController::Destination *MatrixController::find(const QString &id) const
+{
+    for (const auto &destination : destinations)
+        if (destination->id == id)
+            return destination.get();
+    return nullptr;
+}
+
+bool MatrixController::addOutput(QString &id, QString &error)
+{
+    if (destinations.size() >= maxOutputs) {
+        error = "Maximum of 64 outputs reached";
+        return false;
+    }
+    auto d = std::make_unique<Destination>();
+    d->id = QString("rtmp-%1").arg(nextOutputId++, 2, 10, QLatin1Char('0'));
+    d->name = QString("Output %1").arg(destinations.size() + 1);
+    d->audioMix = int(destinations.size() % 16);
+    id = d->id;
+    destinations.push_back(std::move(d));
+    save();
+    return true;
+}
+
+bool MatrixController::removeOutput(const QString &id, QString &error)
+{
+    const auto it = std::find_if(destinations.begin(), destinations.end(),
+                                 [&id](const auto &d) { return d->id == id; });
+    if (it == destinations.end()) {
+        error = "Unknown output";
+        return false;
+    }
+    if ((*it)->output && obs_output_active((*it)->output)) {
+        error = "Stop the output before removing it";
+        return false;
+    }
+    release(**it);
+    destinations.erase(it);
+    QSettings settings(QSettings::IniFormat, QSettings::UserScope, "Giantturning", "OBSMatrixStudio");
+    settings.remove(id);
+    save();
+    return true;
+}
+
+void MatrixController::release(Destination &d)
+{
+    // libobs reference-counts output/encoder/service attachment.
+    if (d.output) {
+        obs_output_release(d.output);
+        d.output = nullptr;
+    }
+    if (d.video) {
+        obs_encoder_release(d.video);
+        d.video = nullptr;
+    }
+    if (d.audio) {
+        obs_encoder_release(d.audio);
+        d.audio = nullptr;
+    }
+    if (d.service) {
+        obs_service_release(d.service);
+        d.service = nullptr;
+    }
+    if (d.view) {
+        obs_view_remove(d.view);
+        obs_view_destroy(d.view);
+        d.view = nullptr;
+    }
+}
+
+void MatrixController::save() const
+{
+    // The per-user OBSMatrixStudio.ini file contains stream keys.
+    // Do not share this file; API responses never include the keys.
+    QSettings settings(QSettings::IniFormat, QSettings::UserScope, "Giantturning", "OBSMatrixStudio");
+    settings.setValue("nextOutputId", qulonglong(nextOutputId));
+    for (const auto &destination : destinations) {
+        const Destination &d = *destination;
+        settings.beginGroup(d.id);
+        settings.setValue("name", d.name);
+        settings.setValue("server", d.server);
+        settings.setValue("key", MatrixSecrets::protect(d.key));
+        settings.setValue("audioMix", d.audioMix);
+        settings.setValue("videoBitrate", d.videoBitrate);
+        settings.setValue("videoEncoderId", d.videoEncoderId);
+        settings.setValue("audioBitrate", d.audioBitrate);
+        settings.setValue("videoSourceUuid", d.videoSourceUuid);
+        settings.setValue("group", d.group);
+        settings.setValue("backupServer", d.backupServer);
+        settings.setValue("backupKey", MatrixSecrets::protect(d.backupKey));
+        settings.setValue("failoverEnabled", d.failoverEnabled);
+        settings.endGroup();
+    }
+    settings.sync();
+}
+
+
+void MatrixController::onAudioSamples(void *param, size_t, struct audio_data *data)
+{
+    auto *meter = static_cast<BusMeter *>(param);
+    if (!data || !data->data[0])
+        return;
+    float maximum = 0.0f;
+    const auto *left = reinterpret_cast<const float *>(data->data[0]);
+    const auto *right = reinterpret_cast<const float *>(data->data[1]);
+    for (uint32_t i = 0; i < data->frames; i += 4) {
+        maximum = std::max(maximum, std::abs(left[i]));
+        if (right)
+            maximum = std::max(maximum, std::abs(right[i]));
+    }
+    const float db = maximum > 0.00001f ? 20.0f * std::log10(maximum) : -96.0f;
+    meter->peakDb.store(std::clamp(db, -96.0f, 6.0f), std::memory_order_relaxed);
+    if (db > -55.0f) {
+        const auto milliseconds = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count();
+        meter->lastSignalMs.store(qint64(milliseconds), std::memory_order_relaxed);
+    }
+}
+
+QJsonArray MatrixController::videoEncoders() const
+{
+    QJsonArray result;
+    const char *id = nullptr;
+    for (size_t idx = 0; obs_enum_encoder_types(idx, &id); ++idx) {
+        if (!id || obs_get_encoder_type(id) != OBS_ENCODER_VIDEO)
+            continue;
+        const char *codec = obs_get_encoder_codec(id);
+        if (!codec || QByteArray(codec).toLower() != "h264")
+            continue;
+        result.append(QJsonObject{{"id", QString::fromUtf8(id)}});
+    }
+    return result;
+}
+
+QJsonArray MatrixController::audioMeters() const
+{
+    QJsonArray result;
+    const auto now = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();
+    for (size_t i = 0; i < busMeters.size(); ++i) {
+        const auto &meter = busMeters[i];
+        const float db = meter.peakDb.load(std::memory_order_relaxed);
+        const qint64 last = meter.lastSignalMs.load(std::memory_order_relaxed);
+        result.append(QJsonObject{{"bus", int(i + 1)}, {"peakDb", double(db)},
+                                  {"silenceSeconds", double(now - last) / 1000.0},
+                                  {"connected", meter.connected}});
+    }
+    return result;
+}
+
+QJsonArray MatrixController::outputs() const
+{
+    QJsonArray result;
+    for (const auto &destination : destinations) {
+        const Destination &d = *destination;
+        QJsonObject item;
+        item["id"] = d.id;
+        item["name"] = d.name;
+        item["server"] = d.server;
+        item["keyConfigured"] = !d.key.isEmpty();
+        item["audioMix"] = d.audioMix + 1;
+        item["videoBitrate"] = d.videoBitrate;
+        item["videoEncoderId"] = d.videoEncoderId;
+        item["audioBitrate"] = d.audioBitrate;
+        item["videoSourceUuid"] = d.videoSourceUuid;
+        item["group"] = d.group;
+        item["backupServer"] = d.backupServer;
+        item["backupKeyConfigured"] = !d.backupKey.isEmpty();
+        item["failoverEnabled"] = d.failoverEnabled;
+        item["backupActive"] = d.backupActive;
+        item["desiredActive"] = d.desiredActive;
+        item["bitrateKbps"] = d.lastKbps;
+        item["audioPeakDb"] = double(busMeters[size_t(d.audioMix)].peakDb.load(std::memory_order_relaxed));
+        const qint64 last = busMeters[size_t(d.audioMix)].lastSignalMs.load(std::memory_order_relaxed);
+        const auto now = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count();
+        item["silenceAlert"] = d.output && obs_output_active(d.output) &&
+                              (now - last > 10000);
+
+        item["connectTimeMs"] = d.output && obs_output_active(d.output) ? obs_output_get_connect_time_ms(d.output) : 0;
+        item["totalFrames"] = d.output ? obs_output_get_total_frames(d.output) : 0;
+        item["active"] = d.output && obs_output_active(d.output);
+        item["reconnecting"] = d.output && obs_output_reconnecting(d.output);
+        item["bytesSent"] = d.output ? double(obs_output_get_total_bytes(d.output)) : 0.0;
+        item["droppedFrames"] = d.output ? obs_output_get_frames_dropped(d.output) : 0;
+        item["lastError"] = d.lastError;
+        result.append(item);
+    }
+    return result;
+}
+
+QJsonArray MatrixController::sources() const
+{
+    SourceList list;
+    obs_enum_sources(collectAudioSources, &list);
+    return list.sources;
+}
+
+QJsonObject MatrixController::mainStatus() const
+{
+    obs_source_t *scene = obs_frontend_get_current_scene();
+    QJsonObject status{{"streaming", obs_frontend_streaming_active()},
+                       {"recording", obs_frontend_recording_active()},
+                       {"studioMode", obs_frontend_preview_program_mode_active()},
+                       {"programSceneUuid", scene ? QString::fromUtf8(obs_source_get_uuid(scene)) : QString()},
+                       {"programSceneName", scene ? QString::fromUtf8(obs_source_get_name(scene)) : QString()}};
+    if (scene)
+        obs_source_release(scene);
+    return status;
+}
+
+bool MatrixController::controlMain(const QString &action, QString &error)
+{
+    if (action == "stream/start")
+        obs_frontend_streaming_start();
+    else if (action == "stream/stop")
+        obs_frontend_streaming_stop();
+    else if (action == "record/start")
+        obs_frontend_recording_start();
+    else if (action == "record/stop")
+        obs_frontend_recording_stop();
+    else if (action == "studio/enable")
+        obs_frontend_set_preview_program_mode(true);
+    else if (action == "studio/disable")
+        obs_frontend_set_preview_program_mode(false);
+    else {
+        error = "Unknown OBS frontend action";
+        return false;
+    }
+    return true;
+}
+
+bool MatrixController::setProgramScene(const QString &uuid, QString &error)
+{
+    obs_source_t *source = obs_get_source_by_uuid(uuid.toUtf8().constData());
+    if (!source || !obs_scene_from_source(source)) {
+        if (source)
+            obs_source_release(source);
+        error = "Scene not found";
+        return false;
+    }
+    obs_frontend_set_current_scene(source);
+    obs_source_release(source);
+    return true;
+}
+
+bool MatrixController::controlAudioSource(const QString &uuid, const QJsonObject &changes, QString &error)
+{
+    obs_source_t *source = obs_get_source_by_uuid(uuid.toUtf8().constData());
+    if (!source) {
+        error = "Audio source not found";
+        return false;
+    }
+    if (!(obs_source_get_output_flags(source) & OBS_SOURCE_AUDIO)) {
+        obs_source_release(source);
+        error = "Source has no audio";
+        return false;
+    }
+    if (changes.contains("muted") && !changes.value("muted").isBool()) {
+        obs_source_release(source);
+        error = "muted must be a boolean";
+        return false;
+    }
+    if (changes.contains("volume") &&
+        (!changes.value("volume").isDouble() || changes.value("volume").toDouble() < 0.0 ||
+         changes.value("volume").toDouble() > 4.0)) {
+        obs_source_release(source);
+        error = "volume must be 0.0..4.0";
+        return false;
+    }
+    if (changes.contains("muted"))
+        obs_source_set_muted(source, changes.value("muted").toBool());
+    if (changes.contains("volume"))
+        obs_source_set_volume(source, float(changes.value("volume").toDouble()));
+    obs_source_release(source);
+    return true;
+}
+
+QJsonObject MatrixController::status() const
+{
+    return QJsonObject{{"mainStreaming", obs_frontend_streaming_active()},
+                       {"program", mainStatus()},
+                       {"matrixOutputs", outputs()},
+                       {"audioSources", sources()},
+                       {"videoScenes", scenes()},
+                       {"groups", groups()},
+                       {"audioBusCount", 16}, {"audioMeters", audioMeters()},
+                       {"videoEncoders", videoEncoders()},
+                       {"cpuPercent", lastCpuPercent},
+                       {"processMemoryMb", double(os_get_proc_resident_size()) / (1024.0 * 1024.0)}};
+}
+
+bool MatrixController::configure(const QString &id, const QJsonObject &changes, QString &error)
+{
+    Destination *d = find(id);
+    if (!d) {
+        error = "Unknown output";
+        return false;
+    }
+    if (d->output && obs_output_active(d->output)) {
+        error = "Stop this output before changing its configuration";
+        return false;
+    }
+
+    // Validate everything before applying any field (atomic configuration update).
+    const QString server = changes.contains("server") ? changes.value("server").toString() : d->server;
+    const QString key = changes.contains("key") ? changes.value("key").toString() : d->key;
+    const QString name = changes.contains("name") ? changes.value("name").toString() : d->name;
+    const int mix = changes.contains("audioMix") ? changes.value("audioMix").toInt(-1) : d->audioMix + 1;
+    const int videoBitrate =
+        changes.contains("videoBitrate") ? changes.value("videoBitrate").toInt(-1) : d->videoBitrate;
+    const QString videoEncoderId = changes.contains("videoEncoderId")
+        ? changes.value("videoEncoderId").toString() : d->videoEncoderId;
+    bool encoderFound = false;
+    for (const auto &value : videoEncoders()) {
+        if (value.toObject().value("id").toString() == videoEncoderId) {
+            encoderFound = true;
+            break;
+        }
+    }
+    if (!encoderFound) {
+        error = "Selected H.264 video encoder is unavailable";
+        return false;
+    }
+    const int audioBitrate =
+        changes.contains("audioBitrate") ? changes.value("audioBitrate").toInt(-1) : d->audioBitrate;
+    const QString scene = changes.contains("videoSourceUuid") ? changes.value("videoSourceUuid").toString() : d->videoSourceUuid;
+    const QString group = changes.contains("group") ? changes.value("group").toString() : d->group;
+    const QString backupServer = changes.contains("backupServer") ? changes.value("backupServer").toString() : d->backupServer;
+    const QString backupKey = changes.contains("backupKey") ? changes.value("backupKey").toString() : d->backupKey;
+    const bool failover = changes.contains("failoverEnabled") ? changes.value("failoverEnabled").toBool() : d->failoverEnabled;
+    if (!scene.isEmpty()) {
+        bool found = false;
+        for (const auto &value : scenes()) {
+            if (value.toObject().value("uuid").toString() == scene) {
+                found = true;
+                break;
+            }
+        }
+        if (!found) {
+            error = "Scene not found";
+            return false;
+        }
+    }
+
+    if ((!server.isEmpty() && !isAllowedServer(server)) || server.size() > 2048 ||
+        key.size() > 2048 || name.trimmed().isEmpty() || name.size() > 128 ||
+        mix < 1 || mix > 16 || videoBitrate < 500 || videoBitrate > 50000 ||
+        audioBitrate < 64 || audioBitrate > 320 || group.isEmpty() || group.size() > 64 ||
+        (!backupServer.isEmpty() && !isAllowedServer(backupServer)) || backupServer.size() > 2048 ||
+        backupKey.size() > 2048) {
+        error = "Invalid configuration (RTMP(S) URL, name, audioBus 1-16 or bitrate)";
+        return false;
+    }
+
+    d->server = server;
+    d->key = key;
+    d->name = name;
+    d->audioMix = mix - 1;
+    d->videoBitrate = videoBitrate;
+    d->videoEncoderId = videoEncoderId;
+    d->audioBitrate = audioBitrate;
+    d->videoSourceUuid = scene;
+    d->group = group;
+    d->backupServer = backupServer;
+    d->backupKey = backupKey;
+    d->failoverEnabled = failover;
+    d->lastError.clear();
+    save();
+    return true;
+}
+
+bool MatrixController::startAttempt(Destination &d, bool useBackup, QString &error)
+{
+    if (!obs_get_video() || !obs_get_audio()) {
+        error = "OBS audio/video is not initialized";
+        return false;
+    }
+    const QString server = useBackup ? d.backupServer : d.server;
+    const QString key = useBackup ? d.backupKey : d.key;
+    if (!isAllowedServer(server) || key.isEmpty()) {
+        error = "RTMP(S) server or key is missing";
+        return false;
+    }
+
+    release(d);
+    const QString prefix = QString("matrix_%1").arg(d.id);
+    video_t *videoContext = obs_get_video();
+    if (!d.videoSourceUuid.isEmpty()) {
+        obs_source_t *sceneSource = obs_get_source_by_uuid(d.videoSourceUuid.toUtf8().constData());
+        if (!sceneSource || !obs_scene_from_source(sceneSource)) {
+            if (sceneSource)
+                obs_source_release(sceneSource);
+            error = "Selected video scene no longer exists";
+            return false;
+        }
+        d.view = obs_view_create();
+        if (d.view) {
+            obs_view_set_source(d.view, 0, sceneSource);
+            videoContext = obs_view_add(d.view);
+        }
+        obs_source_release(sceneSource);
+        if (!d.view || !videoContext) {
+            error = "Could not create independent OBS video view";
+            release(d);
+            return false;
+        }
+    }
+
+    obs_data_t *videoSettings = obs_data_create();
+    obs_data_set_string(videoSettings, "rate_control", "CBR");
+    obs_data_set_int(videoSettings, "bitrate", d.videoBitrate);
+    obs_data_set_int(videoSettings, "keyint_sec", 2);
+    if (d.videoEncoderId == "obs_x264")
+        obs_data_set_string(videoSettings, "preset", "veryfast");
+
+    // Encoder sharing is safe only when video settings and video context match.
+    for (const auto &other : destinations) {
+        if (other.get() == &d || !other->video || !obs_encoder_active(other->video))
+            continue;
+        if (other->videoSourceUuid == d.videoSourceUuid && other->videoBitrate == d.videoBitrate &&
+            other->videoEncoderId == d.videoEncoderId &&
+            other->video && other->videoSourceUuid.isEmpty()) {
+            d.video = obs_encoder_get_ref(other->video);
+            break;
+        }
+    }
+    if (!d.video)
+        d.video = obs_video_encoder_create(d.videoEncoderId.toUtf8().constData(), (prefix + "_video").toUtf8().constData(),
+                                           videoSettings, nullptr);
+    obs_data_release(videoSettings);
+
+    const char *aacId = GetSimpleAACEncoderForBitrate(d.audioBitrate);
+    if (aacId) {
+        obs_data_t *audioSettings = obs_data_create();
+        obs_data_set_int(audioSettings, "bitrate", d.audioBitrate);
+        d.audio = obs_audio_encoder_create(aacId, (prefix + "_audio").toUtf8().constData(),
+                                           audioSettings, size_t(d.audioMix), nullptr);
+        obs_data_release(audioSettings);
+    }
+
+    obs_data_t *serviceSettings = obs_data_create();
+    obs_data_set_string(serviceSettings, "server", server.toUtf8().constData());
+    obs_data_set_string(serviceSettings, "key", key.toUtf8().constData());
+    d.service = obs_service_create("rtmp_custom", (prefix + "_service").toUtf8().constData(),
+                                    serviceSettings, nullptr);
+    obs_data_release(serviceSettings);
+    d.output = obs_output_create("rtmp_output", (prefix + "_output").toUtf8().constData(),
+                                  nullptr, nullptr);
+
+    if (!d.video || !d.audio || !d.service || !d.output) {
+        error = "Required OBS RTMP, x264 or AAC encoder unavailable";
+        release(d);
+        d.lastError = error;
+        return false;
+    }
+
+    if (!obs_encoder_video(d.video))
+        obs_encoder_set_video(d.video, videoContext);
+    obs_encoder_set_audio(d.audio, obs_get_audio());
+    obs_output_set_video_encoder(d.output, d.video);
+    obs_output_set_audio_encoder(d.output, d.audio, 0);
+    obs_output_set_service(d.output, d.service);
+    obs_output_set_reconnect_settings(d.output, 20, 3);
+
+    if (!obs_output_start(d.output)) {
+        const char *last = obs_output_get_last_error(d.output);
+        error = last && *last ? QString::fromUtf8(last) : QString("RTMP output start failed");
+        d.lastError = error;
+        release(d);
+        return false;
+    }
+    d.lastError.clear();
+    d.backupActive = useBackup;
+    d.failureCount = 0;
+    d.lastBytes = 0;
+    return true;
+}
+
+bool MatrixController::start(const QString &id, QString &error)
+{
+    Destination *d = find(id);
+    if (!d) {
+        error = "Unknown output";
+        return false;
+    }
+    if (d->output && obs_output_active(d->output)) {
+        error = "Already active";
+        return false;
+    }
+    d->desiredActive = true;
+    d->backupActive = false;
+    d->failureCount = 0;
+    if (startAttempt(*d, false, error))
+        return true;
+    if (d->failoverEnabled && startAttempt(*d, true, error))
+        return true;
+    d->desiredActive = false;
+    return false;
+}
+
+bool MatrixController::switchScene(const QString &id, const QString &sceneUuid, QString &error)
+{
+    Destination *d = find(id);
+    if (!d) {
+        error = "Unknown output";
+        return false;
+    }
+    if (!d->output || !obs_output_active(d->output))
+        return configure(id, QJsonObject{{"videoSourceUuid", sceneUuid}}, error);
+    if (!d->view) {
+        error = "Program output cannot switch video views live; stop and configure a scene first";
+        return false;
+    }
+    if (sceneUuid.isEmpty()) {
+        error = "A live independent video view requires a scene UUID";
+        return false;
+    }
+    obs_source_t *scene = obs_get_source_by_uuid(sceneUuid.toUtf8().constData());
+    if (!scene || !obs_scene_from_source(scene)) {
+        if (scene)
+            obs_source_release(scene);
+        error = "Scene not found";
+        return false;
+    }
+    obs_view_set_source(d->view, 0, scene);
+    obs_source_release(scene);
+    d->videoSourceUuid = sceneUuid;
+    save();
+    return true;
+}
+
+bool MatrixController::stop(const QString &id, QString &error)
+{
+    Destination *d = find(id);
+    if (!d) {
+        error = "Unknown output";
+        return false;
+    }
+    if (!d->output || !obs_output_active(d->output)) {
+        error = "Output is not active";
+        return false;
+    }
+    d->desiredActive = false;
+    obs_output_stop(d->output);
+    return true;
+}
+
+bool MatrixController::routeSource(const QString &uuid, int mixers, QString &error)
+{
+    if (mixers < 0 || mixers > 65535) {
+        error = "Mixer mask must be 0..65535";
+        return false;
+    }
+    obs_source_t *source = obs_get_source_by_uuid(uuid.toUtf8().constData());
+    if (!source) {
+        error = "Audio source not found";
+        return false;
+    }
+    if (!(obs_source_get_output_flags(source) & OBS_SOURCE_AUDIO)) {
+        error = "Source has no audio";
+        obs_source_release(source);
+        return false;
+    }
+    obs_source_set_audio_mixers(source, uint32_t(mixers));
+    obs_source_release(source);
+    return true;
+}
+
+
+namespace {
+struct SceneList {
+    QJsonArray scenes;
+};
+bool collectScenes(void *param, obs_source_t *source)
+{
+    auto *data = static_cast<SceneList *>(param);
+    QJsonObject scene;
+    scene["uuid"] = QString::fromUtf8(obs_source_get_uuid(source));
+    scene["name"] = QString::fromUtf8(obs_source_get_name(source));
+    data->scenes.append(scene);
+    return true;
+}
+}
+
+QJsonArray MatrixController::scenes() const
+{
+    SceneList list;
+    obs_enum_scenes(collectScenes, &list);
+    return list.scenes;
+}
+
+QJsonArray MatrixController::groups() const
+{
+    QStringList names;
+    for (const auto &destination : destinations) {
+        if (!names.contains(destination->group))
+            names.append(destination->group);
+    }
+    QJsonArray result;
+    for (const auto &name : names)
+        result.append(name);
+    return result;
+}
+
+QJsonObject MatrixController::startGroup(const QString &group)
+{
+    QJsonArray started, errors;
+    for (const auto &dest : destinations) {
+        if (dest->group != group)
+            continue;
+        QString error;
+        if (dest->output && obs_output_active(dest->output))
+            continue;
+        if (start(dest->id, error)) {
+            started.append(dest->id);
+        } else {
+            errors.append(QJsonObject{{"id", dest->id}, {"error", error}});
+        }
+    }
+    return QJsonObject{{"started", started}, {"errors", errors}};
+}
+
+QJsonObject MatrixController::stopGroup(const QString &group)
+{
+    QJsonArray stopped, errors;
+    for (const auto &dest : destinations) {
+        if (dest->group != group)
+            continue;
+        QString error;
+        if (!dest->output || !obs_output_active(dest->output)) {
+            dest->desiredActive = false;
+            continue;
+        }
+        if (stop(dest->id, error)) {
+            stopped.append(dest->id);
+        } else {
+            errors.append(QJsonObject{{"id", dest->id}, {"error", error}});
+        }
+    }
+    return QJsonObject{{"stopped", stopped}, {"errors", errors}};
+}
+
+QJsonArray MatrixController::presets() const
+{
+    QSettings settings(QSettings::IniFormat, QSettings::UserScope, "Giantturning", "OBSMatrixStudio");
+    settings.beginGroup("Presets");
+    const QStringList names = settings.childKeys();
+    QJsonArray result;
+    for (const QString &name : names)
+        result.append(name);
+    return result;
+}
+
+bool MatrixController::savePreset(const QString &name, QString &error)
+{
+    if (name.isEmpty() || name.size() > 64 || name.contains('/')) {
+        error = "Invalid preset name";
+        return false;
+    }
+    QJsonArray outputList;
+    for (const auto &dest : destinations) {
+        QJsonObject o{{"id", dest->id}, {"name", dest->name}, {"server", dest->server},
+                      {"audioMix", dest->audioMix + 1}, {"videoBitrate", dest->videoBitrate},
+                      {"audioBitrate", dest->audioBitrate}, {"videoEncoderId", dest->videoEncoderId},
+                      {"videoSourceUuid", dest->videoSourceUuid},
+                      {"group", dest->group}, {"backupServer", dest->backupServer},
+                      {"failoverEnabled", dest->failoverEnabled}};
+        outputList.append(o);
+    }
+    // Presets do not duplicate sensitive stream keys.
+    const QJsonObject preset{{"outputs", outputList}, {"audioSources", sources()}};
+    QSettings settings(QSettings::IniFormat, QSettings::UserScope, "Giantturning", "OBSMatrixStudio");
+    settings.beginGroup("Presets");
+    settings.setValue(name, QString::fromUtf8(QJsonDocument(preset).toJson(QJsonDocument::Compact)));
+    settings.sync();
+    return true;
+}
+
+bool MatrixController::loadPreset(const QString &name, QString &error)
+{
+    if (anyActive()) {
+        error = "Stop active outputs before loading a preset";
+        return false;
+    }
+    QSettings settings(QSettings::IniFormat, QSettings::UserScope, "Giantturning", "OBSMatrixStudio");
+    settings.beginGroup("Presets");
+    const QByteArray bytes = settings.value(name).toString().toUtf8();
+    if (bytes.isEmpty()) {
+        error = "Preset not found";
+        return false;
+    }
+    const QJsonDocument doc = QJsonDocument::fromJson(bytes);
+    if (!doc.isObject() || !doc.object().value("outputs").isArray()) {
+        error = "Invalid preset";
+        return false;
+    }
+    const QJsonArray list = doc.object().value("outputs").toArray();
+    // Ensure the referenced scenes and all configurations are valid before applying them.
+    for (const auto &value : list) {
+        const QJsonObject config = value.toObject();
+        if (!find(config.value("id").toString())) {
+            error = "Preset references a removed output";
+            return false;
+        }
+    }
+    for (const auto &value : list) {
+        const QJsonObject config = value.toObject();
+        if (!configure(config.value("id").toString(), config, error))
+            return false;
+    }
+    for (const auto &value : doc.object().value("audioSources").toArray()) {
+        const QJsonObject source = value.toObject();
+        QString routeError;
+        routeSource(source.value("uuid").toString(), source.value("mixers").toInt(), routeError);
+    }
+    return true;
+}
+
+bool MatrixController::deletePreset(const QString &name, QString &error)
+{
+    QSettings settings(QSettings::IniFormat, QSettings::UserScope, "Giantturning", "OBSMatrixStudio");
+    settings.beginGroup("Presets");
+    if (!settings.contains(name)) {
+        error = "Preset not found";
+        return false;
+    }
+    settings.remove(name);
+    return true;
+}
+
+bool MatrixController::anyActive() const
+{
+    for (const auto &dest : destinations)
+        if (dest->output && obs_output_active(dest->output))
+            return true;
+    return false;
+}
+
+void MatrixController::collectTelemetry()
+{
+    if (cpuInfo)
+        lastCpuPercent = os_cpu_usage_info_query(cpuInfo);
+    const qint64 now = QDateTime::currentMSecsSinceEpoch();
+    if (lastTelemetryMs > 0) {
+        const double interval = double(now - lastTelemetryMs) / 1000.0;
+        if (interval > 0.0) {
+            for (const auto &dest : destinations) {
+                const quint64 bytes = dest->output ? obs_output_get_total_bytes(dest->output) : 0;
+                dest->lastKbps = bytes >= dest->lastBytes && dest->output && obs_output_active(dest->output)
+                    ? (double(bytes - dest->lastBytes) * 8.0) / (interval * 1000.0) : 0.0;
+                dest->lastBytes = bytes;
+            }
+        }
+    }
+    lastTelemetryMs = now;
+    tickFailover();
+}
+
+void MatrixController::tickFailover()
+{
+    for (const auto &dest : destinations) {
+        Destination &d = *dest;
+        if (!d.desiredActive || !d.failoverEnabled || d.backupActive ||
+            !isAllowedServer(d.backupServer) || d.backupKey.isEmpty())
+            continue;
+        if (d.output && (obs_output_active(d.output) || obs_output_reconnecting(d.output)))
+            continue;
+        if (d.failureCount >= 1)
+            continue;
+        d.failureCount++;
+        QString error;
+        if (!startAttempt(d, true, error))
+            d.lastError = "Backup failed: " + error;
+    }
+}

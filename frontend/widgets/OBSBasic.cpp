@@ -23,6 +23,7 @@
 #include "ColorSelect.hpp"
 #include "OBSBasicControls.hpp"
 #include "OBSBasicStats.hpp"
+#include <matrix/MatrixDock.hpp>
 #include "plugin-manager/PluginManager.hpp"
 
 #include <obs-module.h>
@@ -1236,6 +1237,11 @@ void OBSBasic::OBSInit()
 	if (safe_mode) {
 		ui->actionRestartSafe->setText(QTStr("Basic.MainMenu.Help.RestartNormal"));
 	}
+
+	// Built-in Matrix Studio: initialize only after libobs is ready.
+	MatrixDock *matrixDock = new MatrixDock(this);
+	addDockWidget(Qt::RightDockWidgetArea, matrixDock);
+	ui->menuDocks->addAction(matrixDock->toggleViewAction());
 
 	UpdatePreviewProgramIndicators();
 	OnFirstLoad();

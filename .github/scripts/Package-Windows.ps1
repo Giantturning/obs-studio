@@ -44,11 +44,10 @@ function Package {
 
     Install-BuildDependencies -WingetFile "${ScriptHome}/.Wingetfile"
 
-    $GitDescription = Invoke-External git describe --tags --long
-    $Tokens = ($GitDescription -split '-')
-    $CommitVersion = $Tokens[0..$($Tokens.Count - 3)] -join '-'
-    $CommitHash = $($Tokens[-1]).SubString(1)
-    $CommitDistance = $Tokens[-2]
+    # Untagged fork: use a stable numeric version and current commit hash.
+    $CommitVersion = '0.0.1'
+    $CommitHash = (Invoke-External git rev-parse --short HEAD).Trim()
+    $CommitDistance = 1
 
     if ( $CommitDistance -gt 0 ) {
         $OutputName = "obs-studio-${CommitVersion}-${CommitHash}"

@@ -10,6 +10,11 @@ target_link_libraries(obs-studio PRIVATE OBS::qt-vertical-scroll-area)
 target_sources(
   obs-studio
   PRIVATE
+    matrix/MatrixController.cpp
+    matrix/MatrixController.hpp
+    matrix/MatrixDock.cpp
+    matrix/MatrixDock.hpp
+    matrix/MatrixSecrets.hpp
     widgets/AudioMixer.cpp
     widgets/AudioMixer.hpp
     widgets/ColorSelect.cpp
@@ -60,3 +65,7 @@ target_sources(
     widgets/StatusBarWidget.cpp
     widgets/StatusBarWidget.hpp
 )
+
+if(WIN32)
+  target_link_libraries(obs-studio PRIVATE Crypt32)
+endif()

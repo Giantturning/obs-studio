@@ -1,0 +1,96 @@
+// OBS Matrix Studio: native multi-RTMP controller (GPL-2.0-or-later).
+#pragma once
+
+#include <QObject>
+#include <QJsonArray>
+#include <QJsonObject>
+#include <QString>
+
+#include <array>
+#include <atomic>
+#include <memory>
+#include <vector>
+
+#include <obs.h>
+#include <util/platform.h>
+
+class MatrixController : public QObject {
+public:
+    explicit MatrixController(QObject *parent = nullptr);
+    ~MatrixController() override;
+
+    QJsonArray outputs() const;
+    QJsonArray sources() const;
+    QJsonArray scenes() const;
+    QJsonArray videoEncoders() const;
+    QJsonArray audioMeters() const;
+    QJsonArray groups() const;
+    QJsonArray presets() const;
+    QJsonObject status() const;
+    QJsonObject mainStatus() const;
+    bool controlMain(const QString &action, QString &error);
+    bool setProgramScene(const QString &uuid, QString &error);
+    bool controlAudioSource(const QString &uuid, const QJsonObject &changes, QString &error);
+    bool addOutput(QString &id, QString &error);
+    bool removeOutput(const QString &id, QString &error);
+    bool configure(const QString &id, const QJsonObject &changes, QString &error);
+    bool start(const QString &id, QString &error);
+    bool stop(const QString &id, QString &error);
+    bool switchScene(const QString &id, const QString &sceneUuid, QString &error);
+    bool routeSource(const QString &uuid, int mixers, QString &error);
+    QJsonObject startGroup(const QString &group);
+    QJsonObject stopGroup(const QString &group);
+    bool savePreset(const QString &name, QString &error);
+    bool loadPreset(const QString &name, QString &error);
+    bool deletePreset(const QString &name, QString &error);
+    void collectTelemetry();
+
+private:
+    struct Destination {
+        QString id;
+        QString name;
+        QString server;
+        QString key;
+        int audioMix = 0; // OBS mixer index (0..15); fork has 16 independent buses.
+        int videoBitrate = 3500; // kbps
+        QString videoEncoderId = "obs_x264"; // Can be NVENC, AMF or QSV if installed.
+        int audioBitrate = 160; // kbps
+        QString videoSourceUuid; // empty means the main OBS program video
+        QString group = "default";
+        QString backupServer;
+        QString backupKey;
+        bool failoverEnabled = false;
+        bool desiredActive = false;
+        bool backupActive = false;
+        int failureCount = 0;
+        quint64 lastBytes = 0;
+        double lastKbps = 0;
+        obs_view_t *view = nullptr;
+        obs_output_t *output = nullptr;
+        obs_encoder_t *video = nullptr;
+        obs_encoder_t *audio = nullptr;
+        obs_service_t *service = nullptr;
+        QString lastError;
+    };
+
+    static constexpr size_t maxOutputs = 64;
+    struct BusMeter {
+        std::atomic<float> peakDb{-96.0f};
+        std::atomic<qint64> lastSignalMs{0};
+        bool connected = false;
+    };
+    std::array<BusMeter, 16> busMeters{};
+    static void onAudioSamples(void *param, size_t mix, struct audio_data *data);
+    std::vector<std::unique_ptr<Destination>> destinations;
+    quint64 nextOutputId = 9;
+    Destination *find(const QString &id);
+    const Destination *find(const QString &id) const;
+    void release(Destination &d);
+    void save() const;
+    void tickFailover();
+    bool startAttempt(Destination &d, bool useBackup, QString &error);
+    bool anyActive() const;
+    qint64 lastTelemetryMs = 0;
+    os_cpu_usage_info_t *cpuInfo = nullptr;
+    double lastCpuPercent = 0.0;
+};
